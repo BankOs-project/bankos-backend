@@ -1,0 +1,37 @@
+# Python & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Entornos virtuales
+.venv/
+venv/
+ENV/
+env/
+
+# Variables de entorno secretas
+.env
+.env.local
+
+# Bases de datos y almacenamiento local
+*.sqlite3
+*.db
+
+# Caches y herramientas de testing / linting
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDEs y editores
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Docker
+.docker/
+
