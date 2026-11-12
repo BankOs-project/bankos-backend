@@ -10,65 +10,91 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.database import Base, engine, get_db
 from app.core.exceptions import setup_exception_handlers
-from app.core.middlewares import CorrelationIdMiddleware
+from app.core.middlewares import (
+    CorrelationIdMiddleware,
+    RateLimitMiddleware,
+    install_correlation_filter,
+)
 from app.core.redis import close_redis_pool, get_redis, init_redis_pool
 from app.core.responses import error_response, success_response
 
-# Importación de modelos ORM para registro en Base.metadata
-from app.modules.accounts.infrastructure.models import AccountModel  # noqa: F401
-from app.modules.accounts.presentation.router import router as accounts_router
-from app.modules.audit.infrastructure.models import AuditLogModel  # noqa: F401
-from app.modules.audit.presentation.router import router as audit_router
-from app.modules.auth_users.infrastructure.models import UserModel  # noqa: F401
-from app.modules.auth_users.presentation.router import router as auth_router
-from app.modules.tenants.infrastructure.models import TenantModel  # noqa: F401
-from app.modules.tenants.presentation.router import router as tenants_router
-from app.modules.transactions.infrastructure.models import TransactionModel  # noqa: F401
-from app.modules.transactions.presentation.router import router as transactions_router
+# Importación de modelos ORM para registro en Base.metadata (orden FK-safe)
+from app.modules.tenants.infrastructure.models import TenantModel          # noqa: F401
+from app.modules.auth_users.infrastructure.models import UserModel          # noqa: F401
+from app.modules.accounts.infrastructure.models import AccountModel         # noqa: F401
+from app.modules.transactions.infrastructure.models import TransactionModel # noqa: F401
+from app.modules.audit.infrastructure.models import AuditLogModel           # noqa: F401
 
-# Configuración básica de logging
+# Routers modulares
+from app.modules.tenants.presentation.router import router as tenants_router
+from app.modules.auth_users.presentation.router import router as auth_router
+from app.modules.accounts.presentation.router import router as accounts_router
+from app.modules.transactions.presentation.router import router as transactions_router
+from app.modules.audit.presentation.router import router as audit_router
+
+# ---------------------------------------------------------------------------
+# Configuración de logging con X-Correlation-ID inyectado en cada línea
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO if not settings.DEBUG else logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] [cid=%(correlation_id)s] %(name)s: %(message)s",
 )
+install_correlation_filter()   # Registra CorrelationIdFilter en root + bankos logger
 logger = logging.getLogger("bankos.main")
 
 
+# ---------------------------------------------------------------------------
+# Ciclo de vida de la aplicación
+# ---------------------------------------------------------------------------
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Gestor del ciclo de vida de la aplicación BankOS (inicio y detención de recursos)."""
-    logger.info("Iniciando BankOS Backend v%s (%s)", settings.VERSION, settings.ENVIRONMENT)
-    
+    """Gestiona la inicialización y el cierre ordenado de todos los recursos de BankOS."""
+    logger.info("Iniciando BankOS Backend v%s [%s]", settings.VERSION, settings.ENVIRONMENT)
+
     # 1. Inicializar pool de conexiones Redis
     await init_redis_pool()
+    logger.info("Pool de Redis inicializado.")
 
-    # 2. Inicializar esquemas de base de datos en PostgreSQL si no existen
+    # 2. Crear todas las tablas en PostgreSQL si aun no existen (DDL auto en startup)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     logger.info("Esquemas de base de datos sincronizados correctamente.")
 
     yield
 
-    # 3. Limpieza al apagar la aplicación
-    logger.info("Deteniendo recursos de BankOS Backend...")
+    # 3. Cierre ordenado de recursos
+    logger.info("Deteniendo BankOS Backend...")
     await close_redis_pool()
     await engine.dispose()
     logger.info("Recursos liberados correctamente.")
 
 
+# ---------------------------------------------------------------------------
 # Inicialización de la aplicación FastAPI
+# ---------------------------------------------------------------------------
+
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
-    description="Backend Monolítico Modular para Sistema Bancario Multitenant como Servicio (BankOS)",
+    description=(
+        "Backend Monolítico Modular para Sistema Bancario Multitenant como Servicio (BankOS). "
+        "Soporta múltiples instituciones financieras aisladas, operaciones multimoneda, "
+        "idempotencia, rate limiting y trazabilidad completa."
+    ),
     docs_url=f"{settings.API_V1_STR}/docs",
     redoc_url=f"{settings.API_V1_STR}/redoc",
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
     lifespan=lifespan,
 )
 
-# 1. Registro de Middlewares Globales (Correlation ID y CORS)
-app.add_middleware(CorrelationIdMiddleware)
+# ---------------------------------------------------------------------------
+# Middlewares (orden de registro = orden de ejecución inverso en Starlette)
+# 1° se ejecuta el último en registrarse → CorrelationId debe estar al final
+# para que el cid esté disponible antes de que RateLimit lo use.
+# ---------------------------------------------------------------------------
+app.add_middleware(RateLimitMiddleware)      # 2° en ejecutarse: aplica límites
+app.add_middleware(CorrelationIdMiddleware)  # 1° en ejecutarse: asigna cid
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
@@ -77,29 +103,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. Configuración de Exception Handlers Estandarizados (Envelope APIResponse)
+# ---------------------------------------------------------------------------
+# Exception Handlers estandarizados (Envelope APIResponse)
+# ---------------------------------------------------------------------------
 setup_exception_handlers(app)
 
-# 3. Enrutador Principal bajo prefijo /api/v1
+# ---------------------------------------------------------------------------
+# Enrutador principal /api/v1
+# ---------------------------------------------------------------------------
 api_v1_router = APIRouter(prefix=settings.API_V1_STR)
 
 
 @api_v1_router.get(
     "/health",
     summary="Verificación de Salud de la Infraestructura",
-    description="Comprueba la conectividad activa con el motor de base de datos PostgreSQL 15 y el clúster de Redis 7.",
+    description=(
+        "Comprueba la conectividad activa con PostgreSQL 15 y Redis 7. "
+        "Retorna el estado de cada servicio bajo el envelope APIResponse."
+    ),
     tags=["Salud y Monitoreo"],
 )
 async def health_check(
     db: AsyncSession = Depends(get_db),
     redis_client: Redis = Depends(get_redis),
 ):
-    """Endpoint de comprobación de salud técnica."""
+    """Verificación técnica de disponibilidad de la infraestructura."""
     db_status = "disconnected"
     redis_status = "disconnected"
     healthy = True
 
-    # 1. Verificación de PostgreSQL
     try:
         result = await db.execute(text("SELECT 1"))
         if result.scalar() == 1:
@@ -108,7 +140,6 @@ async def health_check(
         logger.error("Fallo al verificar PostgreSQL: %s", exc)
         healthy = False
 
-    # 2. Verificación de Redis
     try:
         pong = await redis_client.ping()
         if pong:
@@ -141,12 +172,11 @@ async def health_check(
     )
 
 
-# Registrar routers modulares
-api_v1_router.include_router(tenants_router)
-api_v1_router.include_router(auth_router)
-api_v1_router.include_router(accounts_router)
-api_v1_router.include_router(transactions_router)
-api_v1_router.include_router(audit_router)
+# Registrar routers modulares en orden lógico
+api_v1_router.include_router(tenants_router)        # /api/v1/tenants
+api_v1_router.include_router(auth_router)           # /api/v1/auth
+api_v1_router.include_router(accounts_router)       # /api/v1/accounts
+api_v1_router.include_router(transactions_router)   # /api/v1/transactions
+api_v1_router.include_router(audit_router)          # /api/v1/audit-logs
 
-# Registrar router unificado en la aplicación FastAPI
 app.include_router(api_v1_router)
