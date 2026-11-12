@@ -8,11 +8,19 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.database import engine, get_db
+from app.core.database import Base, engine, get_db
 from app.core.exceptions import setup_exception_handlers
 from app.core.middlewares import CorrelationIdMiddleware
 from app.core.redis import close_redis_pool, get_redis, init_redis_pool
 from app.core.responses import error_response, success_response
+
+# Importación de modelos ORM para registro en Base.metadata
+from app.modules.audit.infrastructure.models import AuditLogModel  # noqa: F401
+from app.modules.audit.presentation.router import router as audit_router
+from app.modules.auth_users.infrastructure.models import UserModel  # noqa: F401
+from app.modules.auth_users.presentation.router import router as auth_router
+from app.modules.tenants.infrastructure.models import TenantModel  # noqa: F401
+from app.modules.tenants.presentation.router import router as tenants_router
 
 # Configuración básica de logging
 logging.basicConfig(
@@ -26,10 +34,18 @@ logger = logging.getLogger("bankos.main")
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Gestor del ciclo de vida de la aplicación BankOS (inicio y detención de recursos)."""
     logger.info("Iniciando BankOS Backend v%s (%s)", settings.VERSION, settings.ENVIRONMENT)
-    # Inicializar pool de conexiones Redis
+    
+    # 1. Inicializar pool de conexiones Redis
     await init_redis_pool()
+
+    # 2. Inicializar esquemas de base de datos en PostgreSQL si no existen
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    logger.info("Esquemas de base de datos sincronizados correctamente.")
+
     yield
-    # Limpieza al apagar la aplicación
+
+    # 3. Limpieza al apagar la aplicación
     logger.info("Deteniendo recursos de BankOS Backend...")
     await close_redis_pool()
     await engine.dispose()
@@ -121,6 +137,10 @@ async def health_check(
     )
 
 
-# Registrar router v1 en la aplicación
-app.include_router(api_v1_router)
+# Registrar routers modulares de la Entrega 2
+api_v1_router.include_router(tenants_router)
+api_v1_router.include_router(auth_router)
+api_v1_router.include_router(audit_router)
 
+# Registrar router unificado en la aplicación FastAPI
+app.include_router(api_v1_router)
