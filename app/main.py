@@ -23,6 +23,8 @@ from app.modules.auth_users.infrastructure.models import UserModel  # noqa: F401
 from app.modules.auth_users.presentation.router import router as auth_router
 from app.modules.tenants.infrastructure.models import TenantModel  # noqa: F401
 from app.modules.tenants.presentation.router import router as tenants_router
+from app.modules.transactions.infrastructure.models import TransactionModel  # noqa: F401
+from app.modules.transactions.presentation.router import router as transactions_router
 
 # Configuración básica de logging
 logging.basicConfig(
@@ -143,6 +145,7 @@ async def health_check(
 api_v1_router.include_router(tenants_router)
 api_v1_router.include_router(auth_router)
 api_v1_router.include_router(accounts_router)
+api_v1_router.include_router(transactions_router)
 api_v1_router.include_router(audit_router)
 
 # Registrar router unificado en la aplicación FastAPI
