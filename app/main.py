@@ -15,6 +15,8 @@ from app.core.redis import close_redis_pool, get_redis, init_redis_pool
 from app.core.responses import error_response, success_response
 
 # Importación de modelos ORM para registro en Base.metadata
+from app.modules.accounts.infrastructure.models import AccountModel  # noqa: F401
+from app.modules.accounts.presentation.router import router as accounts_router
 from app.modules.audit.infrastructure.models import AuditLogModel  # noqa: F401
 from app.modules.audit.presentation.router import router as audit_router
 from app.modules.auth_users.infrastructure.models import UserModel  # noqa: F401
@@ -137,9 +139,10 @@ async def health_check(
     )
 
 
-# Registrar routers modulares de la Entrega 2
+# Registrar routers modulares
 api_v1_router.include_router(tenants_router)
 api_v1_router.include_router(auth_router)
+api_v1_router.include_router(accounts_router)
 api_v1_router.include_router(audit_router)
 
 # Registrar router unificado en la aplicación FastAPI

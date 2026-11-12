@@ -1,0 +1,165 @@
+import uuid
+from fastapi import APIRouter, Depends, Query, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database import get_db
+from app.core.exceptions import AuthorizationFailedException, ResourceNotFoundException
+from app.core.responses import success_response
+from app.modules.accounts.application.dtos import CreateAccountDTO
+from app.modules.accounts.application.use_cases import (
+    CreateAccountUseCase,
+    DeactivateAccountUseCase,
+    ListAccountsUseCase,
+)
+from app.modules.accounts.infrastructure.repositories import PostgresAccountRepository
+from app.modules.audit.infrastructure.repositories import PostgresAuditRepository
+from app.modules.auth_users.domain.entities import UserRole
+from app.modules.auth_users.infrastructure.repositories import PostgresUserRepository
+from app.modules.auth_users.presentation.dependencies import (
+    AuthenticatedUser,
+    get_current_user,
+)
+
+router = APIRouter(prefix="/accounts", tags=["Cuentas Bancarias"])
+
+
+@router.post(
+    "",
+    summary="Apertura de cuenta bancaria",
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_account(
+    dto: CreateAccountDTO,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+):
+    """Crea una nueva cuenta bancaria en la divisa seleccionada dentro del tenant.
+    
+    - Si el usuario es 'cliente', la cuenta se vincula automáticamente a su ID.
+    - Si el usuario es 'administrador', puede especificar el owner_id de un cliente de la institución.
+    """
+    account_repo = PostgresAccountRepository(session)
+    user_repo = PostgresUserRepository(session)
+    audit_repo = PostgresAuditRepository(session)
+    use_case = CreateAccountUseCase(account_repo, user_repo, audit_repo)
+
+    result = await use_case.execute(
+        tenant_id=current_user.tenant_id,
+        dto=dto,
+        actor_user_id=current_user.user_id,
+        actor_role=current_user.role,
+    )
+
+    return success_response(
+        data=result.model_dump(mode="json"),
+        message="Cuenta bancaria creada exitosamente",
+        internal_code="ACCOUNT_CREATED",
+        status_code=status.HTTP_201_CREATED,
+    )
+
+
+@router.get(
+    "",
+    summary="Listar cuentas bancarias",
+)
+async def list_accounts(
+    owner_id: uuid.UUID | None = Query(None, description="Filtrar por titular (solo aplicable para rol administrador)"),
+    skip: int = Query(0, ge=0, description="Registros a omitir"),
+    limit: int = Query(50, ge=1, le=100, description="Límite por página"),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+):
+    """Obtiene el listado de cuentas bancarias según el rol:
+    
+    - 'cliente': devuelve únicamente las cuentas de las cuales es titular.
+    - 'administrador': devuelve todas las cuentas de la institución financiera o las del cliente filtrado.
+    """
+    account_repo = PostgresAccountRepository(session)
+    use_case = ListAccountsUseCase(account_repo)
+
+    result = await use_case.execute(
+        tenant_id=current_user.tenant_id,
+        actor_user_id=current_user.user_id,
+        actor_role=current_user.role,
+        owner_id=owner_id,
+        skip=skip,
+        limit=limit,
+    )
+
+    return success_response(
+        data=result.model_dump(mode="json"),
+        message="Cuentas bancarias obtenidas exitosamente",
+        internal_code="ACCOUNTS_FETCHED",
+    )
+
+
+@router.get(
+    "/{account_number}",
+    summary="Consultar detalle de una cuenta bancaria",
+)
+async def get_account_detail(
+    account_number: str,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+):
+    """Consulta los datos y saldo actual de una cuenta bancaria asegurando autorización."""
+    account_repo = PostgresAccountRepository(session)
+    account = await account_repo.get_by_account_number(
+        account_number=account_number,
+        tenant_id=current_user.tenant_id,
+    )
+    if not account:
+        raise ResourceNotFoundException(
+            f"La cuenta bancaria '{account_number}' no fue encontrada en esta institución"
+        )
+
+    # Validar que si es cliente, sea el titular de la cuenta
+    if current_user.role == UserRole.CLIENT and account.owner_id != current_user.user_id:
+        raise AuthorizationFailedException("No posee permisos para consultar esta cuenta")
+
+    data = {
+        "id": str(account.id),
+        "account_number": account.account_number,
+        "owner_id": str(account.owner_id),
+        "tenant_id": str(account.tenant_id),
+        "balance": str(account.balance),
+        "currency": account.currency,
+        "status": account.status.value,
+        "created_at": account.created_at.isoformat(),
+        "updated_at": account.updated_at.isoformat(),
+    }
+
+    return success_response(
+        data=data,
+        message="Detalle de la cuenta obtenido exitosamente",
+        internal_code="ACCOUNT_DETAIL_FETCHED",
+    )
+
+
+@router.patch(
+    "/{account_number}/deactivate",
+    summary="Desactivar cuenta bancaria (Soft Delete con auditoría)",
+)
+async def deactivate_account(
+    account_number: str,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+):
+    """Aplica borrado lógico (estado INACTIVE) a la cuenta bancaria y audita el cambio."""
+    account_repo = PostgresAccountRepository(session)
+    audit_repo = PostgresAuditRepository(session)
+    use_case = DeactivateAccountUseCase(account_repo, audit_repo)
+
+    result = await use_case.execute(
+        account_number=account_number,
+        tenant_id=current_user.tenant_id,
+        actor_user_id=current_user.user_id,
+        actor_role=current_user.role,
+    )
+
+    return success_response(
+        data=result.model_dump(mode="json"),
+        message="Cuenta bancaria desactivada exitosamente (Soft Delete registrado en auditoría)",
+        internal_code="ACCOUNT_DEACTIVATED",
+    )
+
