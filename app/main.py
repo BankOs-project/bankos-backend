@@ -61,6 +61,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await conn.run_sync(Base.metadata.create_all)
     logger.info("Esquemas de base de datos sincronizados correctamente.")
 
+    # 3. Poblar datos iniciales de demo si la base de datos está vacía (idempotente)
+    try:
+        from scripts.seed_demo import seed
+        from app.core.database import async_session_factory
+        async with async_session_factory() as session:
+            await seed(session)
+    except Exception as exc:
+        logger.warning("No se pudo ejecutar el seed automático: %s", exc)
+
     yield
 
     # 3. Cierre ordenado de recursos
