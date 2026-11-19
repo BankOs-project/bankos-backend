@@ -235,17 +235,26 @@ ACCOUNTS = {
 }
 
 
+from sqlalchemy import select
+
 # ---------------------------------------------------------------------------
 # Lógica de seed
 # ---------------------------------------------------------------------------
 
 async def seed(session: AsyncSession) -> None:
+    # 0. Verificación de idempotencia: si ya existen tenants, no duplicar
+    existing_tenant = await session.execute(select(TenantModel).limit(1))
+    if existing_tenant.scalar_one_or_none() is not None:
+        log.info("ℹ️ Los datos de demostración ya existen en la base de datos (no se requieren cambios).")
+        _print_summary()
+        return
+
     now = datetime.now(timezone.utc)
 
+    # 1. Tenants
     for t_data in TENANTS:
         slug = t_data["slug"]
         log.info("→ Creando tenant: %s", slug)
-
         tenant = TenantModel(
             id=t_data["id"],
             name=t_data["name"],
@@ -261,10 +270,12 @@ async def seed(session: AsyncSession) -> None:
             updated_at=now,
         )
         session.add(tenant)
+    await session.flush()
 
-        # Mapa email → UUID para los accounts
-        email_to_user_id: dict[str, uuid.UUID] = {}
-
+    # 2. Users
+    email_to_user_id: dict[str, uuid.UUID] = {}
+    for t_data in TENANTS:
+        slug = t_data["slug"]
         for u_data in USERS[slug]:
             log.info("  → Usuario [%s]: %s", u_data["role"], u_data["email"])
             user = UserModel(
@@ -280,7 +291,11 @@ async def seed(session: AsyncSession) -> None:
             )
             session.add(user)
             email_to_user_id[u_data["email"]] = u_data["id"]
+    await session.flush()
 
+    # 3. Accounts
+    for t_data in TENANTS:
+        slug = t_data["slug"]
         for a_data in ACCOUNTS[slug]:
             owner_id = email_to_user_id[a_data["owner_key"]]
             log.info(
@@ -300,6 +315,7 @@ async def seed(session: AsyncSession) -> None:
                 updated_at=now,
             )
             session.add(account)
+    await session.flush()
 
     await session.commit()
     log.info("\n✅ Seed completado exitosamente.")

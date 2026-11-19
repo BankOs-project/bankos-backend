@@ -44,17 +44,29 @@ class CorrelationIdFilter(logging.Filter):
         return True
 
 
+_old_factory = logging.getLogRecordFactory()
+
+
+def _record_factory(*args, **kwargs) -> logging.LogRecord:
+    record = _old_factory(*args, **kwargs)
+    record.correlation_id = get_correlation_id() or "-"
+    return record
+
+
 def install_correlation_filter(logger_name: str = "bankos") -> None:
-    """Instala el CorrelationIdFilter en el logger raíz de BankOS y en el root logger."""
+    """Instala la factoría y filtros de Correlation ID para todos los loggers del sistema."""
+    logging.setLogRecordFactory(_record_factory)
+
     cid_filter = CorrelationIdFilter()
-    # Root logger de la aplicación
     bankos_logger = logging.getLogger(logger_name)
     if not any(isinstance(f, CorrelationIdFilter) for f in bankos_logger.filters):
         bankos_logger.addFilter(cid_filter)
-    # Root logger para capturar logs de librerías (SQLAlchemy, uvicorn, etc.)
     root_logger = logging.getLogger()
     if not any(isinstance(f, CorrelationIdFilter) for f in root_logger.filters):
         root_logger.addFilter(cid_filter)
+    for handler in logging.root.handlers:
+        if not any(isinstance(f, CorrelationIdFilter) for f in handler.filters):
+            handler.addFilter(cid_filter)
 
 
 # ---------------------------------------------------------------------------
