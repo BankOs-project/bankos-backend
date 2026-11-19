@@ -9,6 +9,11 @@ from sqlalchemy.orm import DeclarativeBase
 
 from app.core.config import settings
 
+# Soporte SSL para conexiones remotas / cloud como Supabase
+connect_args = {}
+if "supabase.com" in settings.async_database_url or "ssl=require" in settings.async_database_url:
+    connect_args = {"ssl": True}
+
 # Creación del motor asíncrono de base de datos
 engine = create_async_engine(
     settings.async_database_url,
@@ -16,6 +21,7 @@ engine = create_async_engine(
     pool_pre_ping=True,
     pool_size=10,
     max_overflow=20,
+    connect_args=connect_args,
 )
 
 # Fábrica de sesiones asíncronas
