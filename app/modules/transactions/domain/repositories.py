@@ -13,12 +13,15 @@ class TransactionRepository(ABC):
         pass
 
     @abstractmethod
-    async def get_by_idempotency_key(
+    async def get_legacy_by_idempotency_key(
         self,
         idempotency_key: str,
         tenant_id: uuid.UUID,
+        actor_user_id: uuid.UUID,
+        operation_type: OperationType,
+        since: datetime,
     ) -> Transaction | None:
-        """Busca una transacción previa por su clave de idempotencia dentro del tenant."""
+        """Busca un movimiento previo a la introducción de comprobantes HTTP."""
         pass
 
     @abstractmethod
@@ -39,9 +42,10 @@ class TransactionRepository(ABC):
     async def list_by_owner_accounts(
         self,
         tenant_id: uuid.UUID,
-        account_numbers: list[str],
+        owner_id: uuid.UUID,
         skip: int = 0,
         limit: int = 50,
+        account_number: str | None = None,
         operation_type: OperationType | None = None,
         start_date: datetime | None = None,
         end_date: datetime | None = None,

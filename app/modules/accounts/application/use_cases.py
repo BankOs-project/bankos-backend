@@ -175,7 +175,7 @@ class DeactivateAccountUseCase:
         actor_user_id: uuid.UUID,
         actor_role: UserRole,
     ) -> AccountResponseDTO:
-        account = await self.account_repository.get_by_account_number(
+        account = await self.account_repository.get_for_update(
             account_number=account_number,
             tenant_id=tenant_id,
         )

@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 import uuid
-from sqlalchemy import Boolean, DateTime, Numeric, String
+from sqlalchemy import Boolean, DateTime, Numeric, String, false, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -23,6 +23,11 @@ class TenantModel(Base):
         String(150),
         nullable=False,
     )
+    public_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), unique=True, index=True, server_default=func.gen_random_uuid(),
+    )
+    directory_enabled: Mapped[bool] = mapped_column(Boolean, server_default=false())
+    logo_url: Mapped[str | None] = mapped_column(String(2048))
     slug: Mapped[str] = mapped_column(
         String(50),
         unique=True,

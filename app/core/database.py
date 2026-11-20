@@ -18,6 +18,7 @@ if "supabase.com" in settings.async_database_url or "ssl=require" in settings.as
 engine = create_async_engine(
     settings.async_database_url,
     echo=settings.DEBUG,
+    hide_parameters=True,
     pool_pre_ping=True,
     pool_size=10,
     max_overflow=20,

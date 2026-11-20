@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.exceptions import TenantAccessDeniedException
-from app.core.responses import success_response
+from app.core.responses import APIResponse, success_response
 from app.modules.audit.infrastructure.repositories import PostgresAuditRepository
 from app.modules.auth_users.presentation.dependencies import (
     AuthenticatedUser,
@@ -12,6 +12,7 @@ from app.modules.auth_users.presentation.dependencies import (
 )
 from app.modules.tenants.application.dtos import (
     CreateTenantDTO,
+    PublicBankDTO,
     UpdateTenantConfigDTO,
 )
 from app.modules.tenants.application.use_cases import (
@@ -22,6 +23,21 @@ from app.modules.tenants.application.use_cases import (
 from app.modules.tenants.infrastructure.repositories import PostgresTenantRepository
 
 router = APIRouter(prefix="/tenants", tags=["Tenants"])
+directory_router = APIRouter(prefix="/banks", tags=["Directorio de bancos"])
+
+
+@directory_router.get(
+    "",
+    summary="Listar bancos habilitados para el selector público",
+    response_model=APIResponse[list[PublicBankDTO]],
+)
+async def list_public_banks(session: AsyncSession = Depends(get_db)):
+    banks = await PostgresTenantRepository(session).list_public_banks()
+    return success_response(
+        data=[bank.model_dump(mode="json") for bank in banks],
+        message="Directorio de bancos obtenido",
+        internal_code="BANKS_FETCHED",
+    )
 
 
 @router.post(
@@ -39,6 +55,7 @@ async def register_tenant(
     use_case = RegisterTenantUseCase(tenant_repo, audit_repo)
 
     result = await use_case.execute(dto)
+    await session.commit()
     return success_response(
         data=result.model_dump(mode="json"),
         message="Institución financiera registrada exitosamente",
@@ -66,6 +83,7 @@ async def update_tenant_config(
         dto=dto,
         actor_user_id=admin_user.user_id,
     )
+    await session.commit()
     return success_response(
         data=result.model_dump(mode="json"),
         message="Configuración de la institución actualizada exitosamente",
@@ -116,6 +134,7 @@ async def update_tenant_config_by_id(
         dto=dto,
         actor_user_id=admin_user.user_id,
     )
+    await session.commit()
     return success_response(
         data=result.model_dump(mode="json"),
         message="Configuración de la institución actualizada exitosamente",

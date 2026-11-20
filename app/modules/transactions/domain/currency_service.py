@@ -1,5 +1,7 @@
 """Servicio de dominio para cálculos financieros con precisión Decimal."""
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
+from app.core.exceptions import BankOSException
 from app.modules.tenants.domain.entities import FeeType, Tenant
 
 
@@ -37,22 +39,36 @@ def get_exchange_rate(source_currency: str, dest_currency: str, tenant: Tenant) 
 
     rates = tenant.exchange_rates
 
-    if key in rates:
-        return Decimal(str(rates[key])).quantize(QUANTIZE_6, rounding=ROUND_HALF_UP)
+    for rate_key, invert in ((key, False), (reverse_key, True)):
+        if rate_key not in rates:
+            continue
+        try:
+            rate = Decimal(str(rates[rate_key]))
+            if not rate.is_finite() or rate <= 0:
+                continue
+            resolved_rate = (ONE / rate if invert else rate).quantize(
+                QUANTIZE_6, rounding=ROUND_HALF_UP,
+            )
+            if resolved_rate > 0:
+                return resolved_rate
+        except InvalidOperation:
+            continue
 
-    if reverse_key in rates:
-        reverse = Decimal(str(rates[reverse_key]))
-        if reverse == Decimal("0"):
-            raise ValueError(f"Tasa de cambio inversa '{reverse_key}' es cero, división imposible")
-        return (ONE / reverse).quantize(QUANTIZE_6, rounding=ROUND_HALF_UP)
-
-    raise ValueError(
-        f"No se encontró tasa de cambio entre '{src}' y '{dst}' en la configuración del tenant. "
-        f"Claves disponibles: {list(rates.keys())}"
+    raise BankOSException(
+        message=f"No hay una tasa de cambio disponible de {src} a {dst}",
+        internal_code="EXCHANGE_RATE_UNAVAILABLE",
+        status_code=422,
     )
 
 
 def apply_conversion(amount: Decimal, rate: Decimal) -> Decimal:
     """Aplica la tasa de cambio a un monto y retorna el resultado con precisión de 4 decimales."""
-    return (amount * rate).quantize(QUANTIZE_4, rounding=ROUND_HALF_UP)
+    converted = (amount * rate).quantize(QUANTIZE_4, rounding=ROUND_HALF_UP)
+    if converted <= 0:
+        raise BankOSException(
+            message="El monto convertido debe ser mayor que cero",
+            internal_code="INVALID_AMOUNT",
+            status_code=422,
+        )
+    return converted
 

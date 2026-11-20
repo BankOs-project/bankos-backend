@@ -110,20 +110,43 @@ class IdempotencyConflictException(BankOSException):
         )
 
 
+class IdempotencyKeyReusedException(BankOSException):
+    def __init__(self) -> None:
+        super().__init__(
+            message="La clave de idempotencia ya corresponde a otro tipo de operación",
+            internal_code="IDEMPOTENCY_KEY_REUSED",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
 class RateLimitExceededException(BankOSException):
     """Lanzada cuando se supera el límite de peticiones permitido por IP o usuario."""
 
-    def __init__(self, message: str = "Límite de solicitudes excedido. Intente más tarde.", data: Any = None) -> None:
+    def __init__(self, limit: int, window_seconds: int, retry_after: int) -> None:
         super().__init__(
-            message=message,
+            message=f"Límite de solicitudes excedido. Intente en {retry_after} segundos.",
             internal_code="RATE_LIMIT_EXCEEDED",
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            data=data,
+            data={"limit": limit, "window_seconds": window_seconds, "retry_after_seconds": retry_after},
         )
+        self.retry_after = retry_after
+
+
+def rate_limit_response(exc: RateLimitExceededException):
+    response = error_response(
+        message=exc.message, internal_code=exc.internal_code, status_code=exc.status_code, data=exc.data,
+    )
+    response.headers["Retry-After"] = str(exc.retry_after)
+    return response
 
 
 def setup_exception_handlers(app: FastAPI) -> None:
     """Registra manejadores de excepciones globales para garantizar el formato estándar APIResponse."""
+    from app.core.middlewares.correlation_id import CORRELATION_ID_HEADER, correlation_id_ctx
+
+    @app.exception_handler(RateLimitExceededException)
+    async def rate_limit_exception_handler(_: Request, exc: RateLimitExceededException):
+        return rate_limit_response(exc)
 
     @app.exception_handler(BankOSException)
     async def bankos_exception_handler(_: Request, exc: BankOSException):
@@ -167,11 +190,19 @@ def setup_exception_handlers(app: FastAPI) -> None:
         )
 
     @app.exception_handler(Exception)
-    async def generic_exception_handler(_: Request, exc: Exception):
-        logger.exception("Excepción no controlada capturada en middleware global: %s", exc)
-        return error_response(
+    async def generic_exception_handler(request: Request, exc: Exception):
+        correlation_id = getattr(request.state, "correlation_id", "")
+        token = correlation_id_ctx.set(correlation_id)
+        try:
+            logger.exception("Excepción no controlada capturada en middleware global: %s", exc)
+        finally:
+            correlation_id_ctx.reset(token)
+        response = error_response(
             message="Ocurrió un error interno en el servidor",
             internal_code="INTERNAL_SERVER_ERROR",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
+        if correlation_id:
+            response.headers[CORRELATION_ID_HEADER] = correlation_id
+        return response
 

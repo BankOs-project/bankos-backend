@@ -4,18 +4,26 @@ Router de operaciones financieras de BankOS.
 Los endpoints mutables (deposit, withdraw, transfer) usan la dependencia
 `get_idempotency_context` que:
   - Exige el header Idempotency-Key (HTTP 400 si falta)
-  - Bloquea concurrencia con SET NX en Redis (HTTP 409 si está en proceso)
-  - Retorna la respuesta cacheada si ya fue completada (idempotencia real)
-  - Proporciona `store_response()` para cachear el resultado final
+  - Bloquea concurrencia en PostgreSQL (HTTP 409 si está en proceso)
+  - Confirma el comprobante y el movimiento en el mismo commit
+  - Cachea en Redis la respuesta confirmada
 """
-from datetime import datetime
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from decimal import Decimal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Response, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.middlewares.idempotency import IdempotencyContext, get_idempotency_context
+from app.core.exceptions import BankOSException
+from app.core.middlewares.idempotency import (
+    IDEMPOTENCY_WINDOW,
+    IdempotencyContext,
+    get_idempotency_context,
+)
+from app.core.middlewares.rate_limit import enforce_transaction_user_limit
 from app.core.responses import success_response
 from app.modules.accounts.infrastructure.repositories import PostgresAccountRepository
 from app.modules.auth_users.presentation.dependencies import (
@@ -26,6 +34,7 @@ from app.modules.tenants.infrastructure.repositories import PostgresTenantReposi
 from app.modules.transactions.application.dtos import (
     DepositDTO,
     QuoteRequestDTO,
+    TransactionResponseDTO,
     TransferDTO,
     WithdrawDTO,
 )
@@ -35,6 +44,8 @@ from app.modules.transactions.application.use_cases import (
     InternalTransferUseCase,
     QuoteTransactionUseCase,
     WithdrawUseCase,
+    record_rejected_transaction,
+    transaction_to_dto,
 )
 from app.modules.transactions.domain.entities import OperationType
 from app.modules.transactions.infrastructure.repositories import (
@@ -42,17 +53,88 @@ from app.modules.transactions.infrastructure.repositories import (
 )
 from app.modules.transactions.infrastructure.webhook_dispatcher import HttpxWebhookDispatcher
 
-router = APIRouter(prefix="/transactions", tags=["Operaciones Financieras"])
+router = APIRouter(
+    prefix="/transactions",
+    tags=["Operaciones Financieras"],
+    dependencies=[Depends(enforce_transaction_user_limit)],
+)
 
 
 # ---------------------------------------------------------------------------
-# Helper: propaga identidad a request.state para rate limiting e idempotencia
+# Contexto de la solicitud y confirmación de operaciones
 # ---------------------------------------------------------------------------
 
-def _attach_identity_to_state(request: Request, current_user: AuthenticatedUser) -> None:
-    """Escribe tenant_id y user_id en request.state para los middlewares."""
-    request.state.tenant_id = str(current_user.tenant_id)
-    request.state.user_id = str(current_user.user_id)
+_SUCCESS_DETAILS = {
+    OperationType.DEPOSIT: ("DEPOSIT_SUCCESS", "Depósito realizado exitosamente"),
+    OperationType.WITHDRAWAL: ("WITHDRAWAL_SUCCESS", "Retiro realizado exitosamente"),
+    OperationType.TRANSFER: ("TRANSFER_SUCCESS", "Transferencia realizada exitosamente"),
+}
+
+
+def _operation_response(result: TransactionResponseDTO) -> JSONResponse:
+    code, message = _SUCCESS_DETAILS[result.operation_type]
+    return success_response(
+        data=result.model_dump(mode="json", exclude={"failure_code"}),
+        message=message,
+        internal_code=code,
+        status_code=status.HTTP_201_CREATED,
+    )
+
+
+async def _replay_operation(
+    idemp: IdempotencyContext,
+    body_key: str | None,
+    operation_type: OperationType,
+) -> Response | None:
+    replay = await idemp.replay_or_lock(body_key)
+    if replay is not None:
+        return replay
+
+    legacy = await PostgresTransactionRepository(idemp.session).get_legacy_by_idempotency_key(
+        idempotency_key=idemp.idempotency_key,
+        tenant_id=idemp.user.tenant_id,
+        actor_user_id=idemp.user.user_id,
+        operation_type=operation_type,
+        since=datetime.now(timezone.utc) - IDEMPOTENCY_WINDOW,
+    )
+    if legacy is None:
+        return None
+    return await idemp.confirm(
+        _operation_response(transaction_to_dto(legacy)),
+        expires_at=legacy.created_at + IDEMPOTENCY_WINDOW,
+    )
+
+
+@asynccontextmanager
+async def _record_rejection(
+    idemp: IdempotencyContext,
+    operation_type: OperationType,
+    amount: Decimal,
+    *,
+    source_account_number: str | None = None,
+    destination_account_number: str | None = None,
+):
+    try:
+        async with idemp.session.begin_nested():
+            yield
+    except BankOSException as exc:
+        # El savepoint ya revirtió los cambios del movimiento. El intento
+        # rechazado se confirma sin crear un comprobante de éxito.
+        await record_rejected_transaction(
+            PostgresAccountRepository(idemp.session),
+            PostgresTransactionRepository(idemp.session),
+            tenant_id=idemp.user.tenant_id,
+            actor_user_id=idemp.user.user_id,
+            actor_role=idemp.user.role,
+            operation_type=operation_type,
+            amount=amount,
+            source_account_number=source_account_number,
+            destination_account_number=destination_account_number,
+            idempotency_key=idemp.idempotency_key,
+            failure_code=exc.internal_code,
+        )
+        await idemp.session.commit()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -65,18 +147,21 @@ def _attach_identity_to_state(request: Request, current_user: AuthenticatedUser)
 )
 async def quote_transaction(
     dto: QuoteRequestDTO,
-    request: Request,
     current_user: AuthenticatedUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ):
     """Calcula el desglose exacto de comisiones, tasas de cambio y monto final
     antes de confirmar una operación. No toca ningún saldo bancario."""
-    _attach_identity_to_state(request, current_user)
     tenant_repo = PostgresTenantRepository(session)
     account_repo = PostgresAccountRepository(session)
     use_case = QuoteTransactionUseCase(tenant_repo, account_repo)
 
-    result = await use_case.execute(tenant_id=current_user.tenant_id, dto=dto)
+    result = await use_case.execute(
+        tenant_id=current_user.tenant_id,
+        dto=dto,
+        actor_user_id=current_user.user_id,
+        actor_role=current_user.role,
+    )
     return success_response(
         data=result.model_dump(mode="json"),
         message="Cotización calculada exitosamente",
@@ -95,46 +180,34 @@ async def quote_transaction(
 )
 async def deposit(
     dto: DepositDTO,
-    request: Request,
     current_user: AuthenticatedUser = Depends(get_current_user),
-    session: AsyncSession = Depends(get_db),
     idemp: IdempotencyContext = Depends(get_idempotency_context),
 ):
     """Abona fondos a la cuenta indicada de forma atómica con garantía de idempotencia.
 
     Requiere el header **Idempotency-Key** (UUID v4 generado en el cliente).
     """
-    _attach_identity_to_state(request, current_user)
+    replay = await _replay_operation(idemp, dto.idempotency_key, OperationType.DEPOSIT)
+    if replay is not None:
+        return replay
 
-    # Respuesta cacheada → retornar sin re-ejecutar
-    if idemp.cached_response is not None:
-        return idemp.cached_response
-
+    session = idemp.session
     account_repo = PostgresAccountRepository(session)
     tx_repo = PostgresTransactionRepository(session)
     use_case = DepositUseCase(account_repo, tx_repo)
 
-    result = await use_case.execute(
-        tenant_id=current_user.tenant_id,
-        dto=dto,
-        actor_user_id=current_user.user_id,
-        actor_role=current_user.role,
-    )
+    async with _record_rejection(
+        idemp, OperationType.DEPOSIT, dto.amount, destination_account_number=dto.account_number,
+    ):
+        result = await use_case.execute(
+            tenant_id=current_user.tenant_id,
+            dto=dto,
+            actor_user_id=current_user.user_id,
+            actor_role=current_user.role,
+            idempotency_key=idemp.idempotency_key,
+        )
 
-    response_body = result.model_dump(mode="json")
-    await idemp.store_response(status_code=201, body={
-        "success": True,
-        "internal_code": "DEPOSIT_SUCCESS",
-        "message": "Depósito realizado exitosamente",
-        "data": response_body,
-    })
-
-    return success_response(
-        data=response_body,
-        message="Depósito realizado exitosamente",
-        internal_code="DEPOSIT_SUCCESS",
-        status_code=status.HTTP_201_CREATED,
-    )
+    return await idemp.confirm(_operation_response(result))
 
 
 # ---------------------------------------------------------------------------
@@ -148,45 +221,34 @@ async def deposit(
 )
 async def withdraw(
     dto: WithdrawDTO,
-    request: Request,
     current_user: AuthenticatedUser = Depends(get_current_user),
-    session: AsyncSession = Depends(get_db),
     idemp: IdempotencyContext = Depends(get_idempotency_context),
 ):
     """Debita fondos de la cuenta indicada validando saldo y titularidad.
 
     Requiere el header **Idempotency-Key** (UUID v4 generado en el cliente).
     """
-    _attach_identity_to_state(request, current_user)
+    replay = await _replay_operation(idemp, dto.idempotency_key, OperationType.WITHDRAWAL)
+    if replay is not None:
+        return replay
 
-    if idemp.cached_response is not None:
-        return idemp.cached_response
-
+    session = idemp.session
     account_repo = PostgresAccountRepository(session)
     tx_repo = PostgresTransactionRepository(session)
     use_case = WithdrawUseCase(account_repo, tx_repo)
 
-    result = await use_case.execute(
-        tenant_id=current_user.tenant_id,
-        dto=dto,
-        actor_user_id=current_user.user_id,
-        actor_role=current_user.role,
-    )
+    async with _record_rejection(
+        idemp, OperationType.WITHDRAWAL, dto.amount, source_account_number=dto.account_number,
+    ):
+        result = await use_case.execute(
+            tenant_id=current_user.tenant_id,
+            dto=dto,
+            actor_user_id=current_user.user_id,
+            actor_role=current_user.role,
+            idempotency_key=idemp.idempotency_key,
+        )
 
-    response_body = result.model_dump(mode="json")
-    await idemp.store_response(status_code=201, body={
-        "success": True,
-        "internal_code": "WITHDRAWAL_SUCCESS",
-        "message": "Retiro realizado exitosamente",
-        "data": response_body,
-    })
-
-    return success_response(
-        data=response_body,
-        message="Retiro realizado exitosamente",
-        internal_code="WITHDRAWAL_SUCCESS",
-        status_code=status.HTTP_201_CREATED,
-    )
+    return await idemp.confirm(_operation_response(result))
 
 
 # ---------------------------------------------------------------------------
@@ -200,10 +262,8 @@ async def withdraw(
 )
 async def transfer(
     dto: TransferDTO,
-    request: Request,
     background_tasks: BackgroundTasks,
     current_user: AuthenticatedUser = Depends(get_current_user),
-    session: AsyncSession = Depends(get_db),
     idemp: IdempotencyContext = Depends(get_idempotency_context),
 ):
     """Mueve fondos entre dos cuentas de la institución con:
@@ -215,11 +275,11 @@ async def transfer(
 
     Requiere el header **Idempotency-Key** (UUID v4 generado en el cliente).
     """
-    _attach_identity_to_state(request, current_user)
+    replay = await _replay_operation(idemp, dto.idempotency_key, OperationType.TRANSFER)
+    if replay is not None:
+        return replay
 
-    if idemp.cached_response is not None:
-        return idemp.cached_response
-
+    session = idemp.session
     tenant_repo = PostgresTenantRepository(session)
     account_repo = PostgresAccountRepository(session)
     tx_repo = PostgresTransactionRepository(session)
@@ -232,40 +292,33 @@ async def transfer(
         webhook_notifier=webhook_dispatcher,
     )
 
-    result = await use_case.execute(
-        tenant_id=current_user.tenant_id,
-        dto=dto,
-        actor_user_id=current_user.user_id,
-        actor_role=current_user.role,
-    )
+    async with _record_rejection(
+        idemp, OperationType.TRANSFER, dto.amount,
+        source_account_number=dto.source_account_number,
+        destination_account_number=dto.destination_account_number,
+    ):
+        result = await use_case.execute(
+            tenant_id=current_user.tenant_id,
+            dto=dto,
+            actor_user_id=current_user.user_id,
+            actor_role=current_user.role,
+            idempotency_key=idemp.idempotency_key,
+        )
 
-    response_body = result.model_dump(mode="json")
-
-    # Cachear la respuesta en Redis antes de responder
-    await idemp.store_response(status_code=201, body={
-        "success": True,
-        "internal_code": "TRANSFER_SUCCESS",
-        "message": "Transferencia realizada exitosamente",
-        "data": response_body,
-    })
+    tenant = await tenant_repo.get_by_id(current_user.tenant_id)
+    response = await idemp.confirm(_operation_response(result))
 
     # Webhook en background (no bloquea la respuesta ni revierte la transacción)
-    tenant = await tenant_repo.get_by_id(current_user.tenant_id)
     if tenant and tenant.webhook_url:
         background_tasks.add_task(
             webhook_dispatcher.dispatch,
             webhook_url=tenant.webhook_url,
             event_type="transfer.completed",
-            payload=response_body,
+            payload=result.model_dump(mode="json", exclude={"failure_code"}),
             correlation_id=result.correlation_id,
         )
 
-    return success_response(
-        data=response_body,
-        message="Transferencia realizada exitosamente",
-        internal_code="TRANSFER_SUCCESS",
-        status_code=status.HTTP_201_CREATED,
-    )
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +330,6 @@ async def transfer(
     summary="Historial paginado de transacciones",
 )
 async def get_transaction_history(
-    request: Request,
     skip: int = Query(0, ge=0, description="Registros a omitir"),
     limit: int = Query(50, ge=1, le=100, description="Límite por página"),
     account_number: str | None = Query(None, description="Filtrar por número de cuenta"),
@@ -291,7 +343,6 @@ async def get_transaction_history(
     - 'cliente': solo ve las operaciones de sus propias cuentas.
     - 'administrador': puede consultar todo el historial de la institución.
     """
-    _attach_identity_to_state(request, current_user)
 
     tx_repo = PostgresTransactionRepository(session)
     account_repo = PostgresAccountRepository(session)

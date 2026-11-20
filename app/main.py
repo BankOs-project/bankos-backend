@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import logging
+import os
 from fastapi import APIRouter, Depends, FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
 from redis.asyncio import Redis
@@ -8,7 +9,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.database import Base, engine, get_db
+from app.core.database import engine, get_db
+from app.core.database_setup import prepare_schema, require_audit_append_only
 from app.core.exceptions import setup_exception_handlers
 from app.core.middlewares import (
     CorrelationIdMiddleware,
@@ -27,6 +29,7 @@ from app.modules.audit.infrastructure.models import AuditLogModel           # no
 
 # Routers modulares
 from app.modules.tenants.presentation.router import router as tenants_router
+from app.modules.tenants.presentation.router import directory_router
 from app.modules.auth_users.presentation.router import router as auth_router
 from app.modules.accounts.presentation.router import router as accounts_router
 from app.modules.transactions.presentation.router import router as transactions_router
@@ -57,8 +60,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("Pool de Redis inicializado.")
 
     # 2. Crear todas las tablas en PostgreSQL si aun no existen (DDL auto en startup)
+    managed_schema = (
+        settings.DATABASE_MANAGED_SCHEMA
+        or settings.ENVIRONMENT.strip().lower() not in {"development", "test"}
+        or bool(os.getenv("RAILWAY_ENVIRONMENT_ID"))
+    )
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+        if managed_schema:
+            await require_audit_append_only(conn)
+            await conn.execute(text("SELECT public_id, directory_enabled, logo_url FROM public.tenants LIMIT 0"))
+            await conn.execute(text("SELECT actor_user_id, failure_code FROM public.transactions LIMIT 0"))
+            await conn.execute(text("SELECT key FROM public.transaction_idempotency_receipts LIMIT 0"))
+            await conn.execute(text("SELECT person_id, email_verified_at FROM public.users LIMIT 0"))
+            await conn.execute(text("SELECT id FROM public.registration_challenges LIMIT 0"))
+        else:
+            await prepare_schema(conn)
     logger.info("Esquemas de base de datos sincronizados correctamente.")
 
     # 3. Poblar datos iniciales de demo si la base de datos está vacía (idempotente)
@@ -183,6 +199,7 @@ async def health_check(
 
 # Registrar routers modulares en orden lógico
 api_v1_router.include_router(tenants_router)        # /api/v1/tenants
+api_v1_router.include_router(directory_router)      # /api/v1/banks
 api_v1_router.include_router(auth_router)           # /api/v1/auth
 api_v1_router.include_router(accounts_router)       # /api/v1/accounts
 api_v1_router.include_router(transactions_router)   # /api/v1/transactions

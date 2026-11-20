@@ -6,6 +6,7 @@ from app.core.database import get_db
 from app.core.exceptions import AuthorizationFailedException, ResourceNotFoundException
 from app.core.responses import success_response
 from app.modules.accounts.application.dtos import CreateAccountDTO
+from app.modules.accounts.domain.entities import AccountStatus
 from app.modules.accounts.application.use_cases import (
     CreateAccountUseCase,
     DeactivateAccountUseCase,
@@ -49,6 +50,7 @@ async def create_account(
         actor_user_id=current_user.user_id,
         actor_role=current_user.role,
     )
+    await session.commit()
 
     return success_response(
         data=result.model_dump(mode="json"),
@@ -90,6 +92,37 @@ async def list_accounts(
         data=result.model_dump(mode="json"),
         message="Cuentas bancarias obtenidas exitosamente",
         internal_code="ACCOUNTS_FETCHED",
+    )
+
+
+@router.get(
+    "/{account_number}/destination",
+    summary="Confirmar destino de una transferencia interna",
+)
+async def get_transfer_destination(
+    account_number: str,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+):
+    account = await PostgresAccountRepository(session).get_by_account_number(
+        account_number=account_number,
+        tenant_id=current_user.tenant_id,
+    )
+    if not account or account.status != AccountStatus.ACTIVE:
+        raise ResourceNotFoundException("Cuenta destino no disponible en esta institución")
+
+    owner = await PostgresUserRepository(session).get_by_id(account.owner_id)
+    if not owner or owner.tenant_id != current_user.tenant_id:
+        raise ResourceNotFoundException("Cuenta destino no disponible en esta institución")
+
+    return success_response(
+        data={
+            "account_number": account.account_number,
+            "holder_name": owner.full_name,
+            "currency": account.currency,
+        },
+        message="Cuenta destino encontrada",
+        internal_code="TRANSFER_DESTINATION_FOUND",
     )
 
 
@@ -156,6 +189,7 @@ async def deactivate_account(
         actor_user_id=current_user.user_id,
         actor_role=current_user.role,
     )
+    await session.commit()
 
     return success_response(
         data=result.model_dump(mode="json"),

@@ -37,6 +37,25 @@ services:
     networks:
       - bankos_network
 
+  database-setup:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "scripts.provision_database", "bankos_app"]
+    environment:
+      DEBUG: "false"
+      POSTGRES_SERVER: "db"
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres_secure_password}"
+      POSTGRES_DB: "${POSTGRES_DB:-bankos_db}"
+      BANKOS_APP_DB_PASSWORD: "${BANKOS_APP_DB_PASSWORD:-bankos_local_app}"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - bankos_network
+
   api:
     build:
       context: .
@@ -54,10 +73,12 @@ services:
       ACCESS_TOKEN_EXPIRE_MINUTES: "60"
       POSTGRES_SERVER: "db"
       POSTGRES_PORT: "5432"
-      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres_secure_password}"
+      POSTGRES_USER: "bankos_app"
+      POSTGRES_PASSWORD: "${BANKOS_APP_DB_PASSWORD:-bankos_local_app}"
       POSTGRES_DB: "${POSTGRES_DB:-bankos_db}"
-      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres_secure_password}@db:5432/${POSTGRES_DB:-bankos_db}"
+      DATABASE_MANAGED_SCHEMA: "true"
+      RESEND_API_KEY: "${RESEND_API_KEY:-}"
+      REGISTRATION_EMAIL_FROM: "${REGISTRATION_EMAIL_FROM:-}"
       REDIS_HOST: "redis"
       REDIS_PORT: "6379"
       REDIS_DB: "0"
@@ -67,6 +88,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      database-setup:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
     networks:

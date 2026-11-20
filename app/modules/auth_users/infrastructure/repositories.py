@@ -1,10 +1,11 @@
+from datetime import datetime
 import uuid
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.auth_users.domain.entities import User, UserRole
 from app.modules.auth_users.domain.repositories import UserRepository
-from app.modules.auth_users.infrastructure.models import UserModel
+from app.modules.auth_users.infrastructure.models import PersonModel, UserModel
 
 
 class PostgresUserRepository(UserRepository):
@@ -26,10 +27,22 @@ class PostgresUserRepository(UserRepository):
             updated_at=model.updated_at,
         )
 
-    async def create(self, user: User) -> User:
+    async def create(
+        self,
+        user: User,
+        *,
+        person_id: uuid.UUID | None = None,
+        email_verified_at: datetime | None = None,
+    ) -> User:
+        if person_id is None:
+            person_id = uuid.uuid4()
+            self.session.add(PersonModel(id=person_id))
+            await self.session.flush()
         model = UserModel(
             id=user.id,
             tenant_id=user.tenant_id,
+            person_id=person_id,
+            email_verified_at=email_verified_at,
             email=user.email,
             hashed_password=user.hashed_password,
             full_name=user.full_name,

@@ -3,6 +3,7 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.tenants.application.dtos import PublicBankDTO
 from app.modules.tenants.domain.entities import FeeType, Tenant
 from app.modules.tenants.domain.repositories import TenantRepository
 from app.modules.tenants.infrastructure.models import TenantModel
@@ -49,8 +50,10 @@ class PostgresTenantRepository(TenantRepository):
         await self.session.flush()
         return self._to_entity(model)
 
-    async def get_by_id(self, tenant_id: uuid.UUID) -> Tenant | None:
+    async def get_by_id(self, tenant_id: uuid.UUID, *, for_update: bool = False) -> Tenant | None:
         stmt = select(TenantModel).where(TenantModel.id == tenant_id)
+        if for_update:
+            stmt = stmt.with_for_update()
         result = await self.session.execute(stmt)
         model = result.scalar_one_or_none()
         return self._to_entity(model) if model else None
@@ -60,6 +63,24 @@ class PostgresTenantRepository(TenantRepository):
         result = await self.session.execute(stmt)
         model = result.scalar_one_or_none()
         return self._to_entity(model) if model else None
+
+    async def get_by_public_id(self, public_id: uuid.UUID) -> Tenant | None:
+        stmt = select(TenantModel).where(
+            TenantModel.public_id == public_id,
+            TenantModel.directory_enabled.is_(True),
+            TenantModel.is_active.is_(True),
+        )
+        model = await self.session.scalar(stmt)
+        return self._to_entity(model) if model else None
+
+    async def list_public_banks(self) -> list[PublicBankDTO]:
+        stmt = (
+            select(TenantModel.public_id, TenantModel.name, TenantModel.logo_url)
+            .where(TenantModel.directory_enabled.is_(True), TenantModel.is_active.is_(True))
+            .order_by(TenantModel.name, TenantModel.public_id)
+        )
+        rows = await self.session.execute(stmt)
+        return [PublicBankDTO(bank_id=bank_id, name=name, logo_url=logo_url) for bank_id, name, logo_url in rows]
 
     async def update(self, tenant: Tenant) -> Tenant:
         stmt = select(TenantModel).where(TenantModel.id == tenant.id)

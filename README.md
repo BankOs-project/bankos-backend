@@ -40,10 +40,34 @@ El paquete `app/core/` provee infraestructura transversal común:
 ## 📡 Estado de la Conexión Frontend ⇄ Backend
 
 La conectividad y el contrato de API están estandarizados para integrarse con clientes móviles y web:
+- [Contrato y ejemplos para Flutter](CONTRATO_FLUTTER.md)
 - **API Base URL:** `http://localhost:8000/api/v1`
 - **Health Check:** `GET /api/v1/health` ➔ `200 OK` (Base de datos y Redis conectados).
 - **Autenticación:** `POST /api/v1/auth/login` ➔ `200 OK` con emisión de JWT.
 - **Frontend Flutter:** El cliente móvil en `bankos-mobile` cuenta con `dio_provider.dart` configurado para resolver dinámicamente `localhost:8000` en Desktop/Web y `10.0.2.2:8000` en emuladores de Android.
+
+### Rol de PostgreSQL y despliegue en Railway
+
+Docker Compose prepara el esquema con el dueño de la base y ejecuta FastAPI con `bankos_app`. La API puede insertar y consultar `audit_logs`. PostgreSQL exige permisos de dueño para los cambios de esquema y rechaza `UPDATE`, `DELETE` y `TRUNCATE` de auditoría con el rol de aplicación.
+
+En Railway, prepara la base antes de desplegar esta versión. Desde una sesión de administración conectada como dueño, crea un rol de login dedicado y asigna su contraseña mediante el cliente de PostgreSQL.
+
+```sql
+CREATE ROLE bankos_app LOGIN;
+-- En psql, usa \password bankos_app para asignar la contraseña de forma interactiva.
+```
+
+En un proceso de administración con `DATABASE_URL` del dueño, ejecuta `uv run --locked python -m scripts.provision_database bankos_app`. Configura el servicio de la API con la `DATABASE_URL` privada de `bankos_app`. Mantén las credenciales del dueño en el entorno de administración. El arranque de Railway comprueba los permisos del rol y el esquema existente.
+
+El aprovisionamiento asigna un UUID público estable a cada banco existente. Los bancos existentes y los nuevos registros quedan ocultos por defecto. El seed habilita los dos bancos demo cuando los crea en una base vacía. Para publicar un banco existente, un operador puede habilitarlo en PostgreSQL y asignar una URL pública HTTPS de logo si dispone de ella.
+
+```sql
+UPDATE public.tenants SET directory_enabled = true WHERE slug = 'banco-andino';
+```
+
+El límite por IP usa la dirección que recibe el servidor. Si un proxy entrega la IP del cliente en `X-Real-IP`, configura `RATE_LIMIT_TRUSTED_PROXIES` con las IP o CIDR comprobadas de los proxies que sobrescriben ese encabezado. Verifica con dos orígenes reales que Railway entregue direcciones distintas antes de habilitar la confianza. [Encabezados de Railway](https://docs.railway.com/networking/public-networking/specs-and-limits)
+
+Para activar el registro por correo, ejecuta el aprovisionamiento con el rol dueño antes de desplegar. Luego configura `RESEND_API_KEY` y `REGISTRATION_EMAIL_FROM` en la API. Usa un remitente habilitado en Resend. Las pruebas de integración simulan la entrega y verifican el registro en PostgreSQL. [API de correo de Resend](https://resend.com/docs/api-reference/emails/send-email)
 
 ---
 

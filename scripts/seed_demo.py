@@ -42,7 +42,7 @@ from app.core.security import get_password_hash
 
 # Modelos ORM (importar todos para que Base.metadata los conozca)
 from app.modules.tenants.infrastructure.models import TenantModel
-from app.modules.auth_users.infrastructure.models import UserModel
+from app.modules.auth_users.infrastructure.models import PersonModel, UserModel
 from app.modules.accounts.infrastructure.models import AccountModel
 from app.modules.transactions.infrastructure.models import TransactionModel  # noqa: F401
 from app.modules.audit.infrastructure.models import AuditLogModel            # noqa: F401
@@ -266,6 +266,7 @@ async def seed(session: AsyncSession) -> None:
             exchange_rates=t_data["exchange_rates"],
             webhook_url=t_data["webhook_url"],
             is_active=True,
+            directory_enabled=True,
             created_at=now,
             updated_at=now,
         )
@@ -278,9 +279,13 @@ async def seed(session: AsyncSession) -> None:
         slug = t_data["slug"]
         for u_data in USERS[slug]:
             log.info("  → Usuario [%s]: %s", u_data["role"], u_data["email"])
+            person = PersonModel(id=uuid.uuid4())
+            session.add(person)
+            await session.flush()
             user = UserModel(
                 id=u_data["id"],
                 tenant_id=t_data["id"],
+                person_id=person.id,
                 email=u_data["email"],
                 hashed_password=get_password_hash(u_data["password"]),
                 full_name=u_data["full_name"],
