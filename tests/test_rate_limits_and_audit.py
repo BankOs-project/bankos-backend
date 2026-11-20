@@ -1,14 +1,14 @@
 """Integración de API y permisos con el rol desechable bankos_app."""
 
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack
 from decimal import Decimal
-from io import StringIO
 import os
 import unittest
 from unittest.mock import patch
 import uuid
 
 from fastapi.testclient import TestClient
+from demo_seed_fixture import load_demo_seed
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
@@ -55,8 +55,8 @@ class RateLimitsAndAuditTest(unittest.TestCase):
                 scope = {**scope, "client": (illustrative_ip.decode(), 1234)}
             await app(scope, receive, send)
 
-        with redirect_stdout(StringIO()):
-            cls.client = stack.enter_context(TestClient(with_client_ip, raise_server_exceptions=False))
+        cls.client = stack.enter_context(TestClient(with_client_ip, raise_server_exceptions=False))
+        cls.client.portal.call(load_demo_seed)
 
         cls.sessions = {}
         for label, tenant, index in (

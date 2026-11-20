@@ -1,7 +1,6 @@
 """Contrato del directorio público y aislamiento del login con PostgreSQL y Redis."""
 
-from contextlib import ExitStack, redirect_stdout
-from io import StringIO
+from contextlib import ExitStack
 import os
 import unittest
 from unittest.mock import patch
@@ -9,6 +8,7 @@ import uuid
 
 from fastapi.testclient import TestClient
 from sqlalchemy import text
+from demo_seed_fixture import load_demo_seed
 
 
 API = "/api/v1"
@@ -56,8 +56,8 @@ class BankDirectoryTest(unittest.TestCase):
                 scope = {**scope, "client": (peer.decode(), 1234)}
             await app(scope, receive, send)
 
-        with redirect_stdout(StringIO()):
-            cls.client = stack.enter_context(TestClient(with_client_ip))
+        cls.client = stack.enter_context(TestClient(with_client_ip))
+        cls.client.portal.call(load_demo_seed)
 
     def directory(self):
         response = self.client.get(f"{API}/banks")

@@ -3,7 +3,7 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.tenants.application.dtos import PublicBankDTO
+from app.modules.tenants.application.dtos import PublicBankDTO, public_logo_url
 from app.modules.tenants.domain.entities import FeeType, Tenant
 from app.modules.tenants.domain.repositories import TenantRepository
 from app.modules.tenants.infrastructure.models import TenantModel
@@ -80,7 +80,10 @@ class PostgresTenantRepository(TenantRepository):
             .order_by(TenantModel.name, TenantModel.public_id)
         )
         rows = await self.session.execute(stmt)
-        return [PublicBankDTO(bank_id=bank_id, name=name, logo_url=logo_url) for bank_id, name, logo_url in rows]
+        return [
+            PublicBankDTO(bank_id=bank_id, name=name, logo_url=public_logo_url(logo_url))
+            for bank_id, name, logo_url in rows
+        ]
 
     async def update(self, tenant: Tenant) -> Tenant:
         stmt = select(TenantModel).where(TenantModel.id == tenant.id)

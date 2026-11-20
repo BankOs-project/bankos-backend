@@ -18,7 +18,7 @@ Idempotency-Key: 34ac2258-ecef-4e61-bc96-a8870088caf2
 
 ## Elige tu banco y login
 
-`GET /banks` es público y no requiere Bearer. Flutter lee `data`, muestra `name` y usa un icono local si `logo_url` es `null`. Guarda `bank_id` como texto opaco y úsalo en el login. Si no hay bancos habilitados, `data` es `[]`. El directorio contiene únicamente bancos activos que se habilitaron expresamente para aparecer.
+`GET /banks` es público y no requiere Bearer. Flutter lee `data`, muestra `name` y usa un icono local si `logo_url` es `null`. La API devuelve `null` si falta un logo HTTPS válido. Guarda `bank_id` como texto opaco y úsalo en el login. Si no hay bancos habilitados, `data` es `[]`. El directorio contiene únicamente bancos activos que se habilitaron expresamente para aparecer.
 
 HTTP 200 · `BANKS_FETCHED`
 
