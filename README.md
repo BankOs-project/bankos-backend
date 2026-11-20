@@ -59,7 +59,7 @@ CREATE ROLE bankos_app LOGIN;
 
 En un proceso de administración con `DATABASE_URL` del dueño, ejecuta `uv run --locked python -m scripts.provision_database bankos_app`. Configura el servicio de la API con la `DATABASE_URL` privada de `bankos_app`. Mantén las credenciales del dueño en el entorno de administración. El arranque de Railway comprueba los permisos del rol y el esquema existente.
 
-El aprovisionamiento asigna un UUID público estable a cada banco existente. Los bancos existentes y los nuevos registros quedan ocultos por defecto. El seed habilita los dos bancos demo cuando los crea en una base vacía. Para publicar un banco existente, un operador puede habilitarlo en PostgreSQL y asignar una URL pública HTTPS de logo si dispone de ella.
+El aprovisionamiento asigna un UUID público estable a cada banco existente. Los bancos existentes y los nuevos registros quedan ocultos por defecto. La carga demo habilita los bancos que crea. Para publicar un banco existente, un operador puede habilitarlo en PostgreSQL.
 
 ```sql
 UPDATE public.tenants SET directory_enabled = true WHERE slug = 'banco-andino';
@@ -151,19 +151,23 @@ Si deseas ejecutar FastAPI directamente en tu máquina Windows para depurar con 
 
 ## 🗄️ Poblar la Base de Datos (Seed de Demostración)
 
-La base de datos arranca inicialmente vacía. Para que el login funcione y existan cuentas para operar, se debe ejecutar el script `seed_demo.py`.
+FastAPI prepara o comprueba el esquema al arrancar. Carga los datos ficticios por separado, con el esquema ya aprovisionado. El comando muestra el servidor y el nombre de la base elegida.
 
-El script es **idempotente**: si los datos ya fueron cargados, no fallará ni creará duplicados.
+Con Docker Compose, usa la base configurada en el servicio `api`.
 
-- **Si estás usando Docker Compose:**
-  ```powershell
-  docker exec bankos_api python scripts/seed_demo.py
-  ```
+```powershell
+docker compose exec api python -m scripts.seed_demo --apply
+```
 
-- **Si estás corriendo con `uv` en local:**
-  ```powershell
-  uv run python scripts/seed_demo.py
-  ```
+Con `uv`, fija `DATABASE_URL` en tu terminal a la base de pruebas elegida antes de ejecutar el comando.
+
+```powershell
+uv run --locked python -m scripts.seed_demo --apply
+```
+
+La carga completa filas faltantes por slug, correo dentro del banco y número de cuenta dentro del banco. Una ejecución normal conserva la visibilidad y toda la configuración existente, además de los UUID públicos, saldos, contraseñas y movimientos.
+
+Para publicar un logo aprobado, agrega `--logo slug=https://...` al comando. Puedes repetir la opción para varios slugs demo. La opción llena un logo ausente y conserva cualquier URL ya guardada. Si falta una URL HTTPS válida, `GET /api/v1/banks` devuelve `logo_url: null`.
 
 ---
 
@@ -180,6 +184,7 @@ Tras ejecutar el seed, dispones de los siguientes datos listos para iniciar sesi
   - Email: `juan@banco-andino.com`
   - Contraseña: `Cliente123!`
   - Cuentas activas: `1000000001` (COP $5.000.000), `1000000002` (USD $1.500)
+  - Cuenta inactiva `1000000005` en COP
 - **Cliente 2 (Jaysir Martínez):**
   - Email: `jaysir@banco-andino.com`
   - Contraseña: `Cliente123!`
@@ -190,8 +195,22 @@ Tras ejecutar el seed, dispones de los siguientes datos listos para iniciar sesi
 - **Administrador:**
   - Email: `admin@coop-caribe.com`
   - Contraseña: `Admin123!`
-- **Cliente 1:** `cliente1@coop-caribe.com` / `Cliente123!`
-- **Cliente 2:** `cliente2@coop-caribe.com` / `Cliente123!`
+- **Cliente 1:** `cliente1@coop-caribe.com` / `Cliente123!`. Cuentas activas `2000000001` (3.000 USD) y `2000000003` (4.500.000 COP).
+- **Cliente 2:** `cliente2@coop-caribe.com` / `Cliente123!`. Cuenta activa `2000000002` (1.200 USD) y bloqueada `2000000004` (500 USD).
+
+### Cinco bancos demo adicionales
+
+El correo tiene el formato `cliente1.<slug>@example.com` o `cliente2.<slug>@example.com`. La contraseña inicial es `BankOSDemo123!`. Los saldos de esta tabla corresponden a la primera carga.
+
+| Banco y slug | Cliente 1 y cuentas activas | Cliente 2, destino activo y cuenta inactiva |
+| --- | --- | --- |
+| Bancolombia · `bancolombia` | Lina Prado Demo · `3100000001` 850.000 COP · `3100000002` 240 USD | Teo Rojas Demo · `3100000003` 25 COP · `3100000004` inactiva |
+| Nu · `nu` | Alma Ríos Demo · `3200000001` 425.000 COP · `3200000002` 80 USD | Bruno Mora Demo · `3200000003` 12 COP · `3200000004` inactiva |
+| DaviPlata · `daviplata` | Vera Sol Demo · `3300000001` 1.230.000 COP · `3300000002` 125 USD | Nico Paz Demo · `3300000003` 5 COP · `3300000004` inactiva |
+| Uno · `uno` | Sara Valle Demo · `3400000001` 185.000 COP · `3400000002` 42 USD | Iván Lago Demo · `3400000003` 50 COP · `3400000004` inactiva |
+| Falabella · `falabella` | Noa Palma Demo · `3500000001` 2.100.000 COP · `3500000002` 350 USD | Elías Nube Demo · `3500000003` 15 COP · `3500000004` inactiva |
+
+Para probar una cotización multimoneda, usa 10 USD desde la cuenta terminada en `02` del cliente 1 hacia la cuenta terminada en `03` del cliente 2 en el mismo banco. Como cliente 2, intenta retirar 100 COP de la cuenta terminada en `03` para obtener saldo insuficiente. Usa la cuenta terminada en `04` para probar un rechazo por cuenta inactiva.
 
 ---
 
@@ -242,7 +261,7 @@ Invoke-RestMethod -Uri "http://localhost:8000/api/v1/auth/login" -Method Post -B
 - **Causa:** La base de datos fue creada pero no contiene registros (está vacía), o el `tenant_slug` no coincide.
 - **Solución:** Ejecutar el seed:
   ```powershell
-  docker exec bankos_api python scripts/seed_demo.py
+  docker compose exec api python -m scripts.seed_demo --apply
   ```
 
 ### Error 2: `[Errno 10048] address already in use` al levantar con Uvicorn
@@ -267,7 +286,7 @@ Invoke-RestMethod -Uri "http://localhost:8000/api/v1/auth/login" -Method Post -B
 
 ### Error 4: `UniqueViolationError: duplicate key value violates unique constraint "tenants_pkey"`
 - **Causa:** El script de seed se intentó ejecutar cuando los datos ya estaban cargados.
-- **Solución:** El script `scripts/seed_demo.py` ahora cuenta con verificación de idempotencia y no fallará; si ya existen los datos simplemente mostrará el resumen de credenciales disponibles.
+- **Solución:** Ejecuta la carga explícita. El script conserva las filas existentes y agrega las faltantes.
 
 ### Error 5: `ForeignKeyViolationError: insert or update on table "accounts" violates foreign key constraint`
 - **Causa:** SQLAlchemy intentaba insertar cuentas antes de guardar los usuarios.

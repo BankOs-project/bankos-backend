@@ -1,7 +1,6 @@
 """Pruebas de alta y vinculación con PostgreSQL, Redis y correo simulado."""
 
-from contextlib import ExitStack, redirect_stdout
-from io import StringIO
+from contextlib import ExitStack
 import os
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -9,6 +8,7 @@ import uuid
 
 from fastapi.testclient import TestClient
 from sqlalchemy import text
+from demo_seed_fixture import load_demo_seed
 
 
 API = "/api/v1"
@@ -50,8 +50,8 @@ class RegistrationTest(unittest.TestCase):
                 scope = {**scope, "client": (peer.decode(), 1234)}
             await app(scope, receive, send)
 
-        with redirect_stdout(StringIO()):
-            cls.client = stack.enter_context(TestClient(with_client_ip))
+        cls.client = stack.enter_context(TestClient(with_client_ip))
+        cls.client.portal.call(load_demo_seed)
         banks = {entry["name"]: entry["bank_id"] for entry in cls.client.get(f"{API}/banks").json()["data"]}
         cls.bank_a = banks["Banco Andino S.A."]
         cls.bank_b = banks["Cooperativa Caribe Ltda."]

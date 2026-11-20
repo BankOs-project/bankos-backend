@@ -7,6 +7,18 @@ from pydantic import BaseModel, Field, HttpUrl, field_validator
 from app.modules.tenants.domain.entities import FeeType
 
 
+def public_logo_url(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        url = HttpUrl(value.strip())
+    except ValueError:
+        return None
+    if url.scheme == "https" and url.username is None and url.password is None:
+        return str(url)
+    return None
+
+
 class PublicBankDTO(BaseModel):
     bank_id: uuid.UUID
     name: str

@@ -2,9 +2,8 @@
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack
 from decimal import Decimal
-from io import StringIO
 import json
 import os
 from threading import Event
@@ -13,6 +12,7 @@ from unittest.mock import patch
 import uuid
 
 from fastapi.testclient import TestClient
+from demo_seed_fixture import load_demo_seed
 from redis.asyncio import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import text
@@ -84,8 +84,8 @@ class TransactionIdempotencyTest(unittest.TestCase):
             "app.modules.transactions.presentation.router.HttpxWebhookDispatcher.dispatch",
             autospec=True,
         ))
-        with redirect_stdout(StringIO()):
-            cls.client = stack.enter_context(TestClient(cls.transport, raise_server_exceptions=False))
+        cls.client = stack.enter_context(TestClient(cls.transport, raise_server_exceptions=False))
+        cls.client.portal.call(load_demo_seed)
 
         cls.sessions = []
         for tenant, index in (("banco-andino", 1), ("banco-andino", 2), ("cooperativa-caribe", 1)):

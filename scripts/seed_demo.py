@@ -1,56 +1,30 @@
-"""
-BankOS — Script de Demostración (seed_demo.py)
-===============================================
-Pobla la base de datos con 2 tenants independientes y completamente aislados,
-cada uno con su administrador, 2 clientes y varias cuentas listas para demostrar
-todos los escenarios del reto en vivo:
-
-  Tenant 1: banco-andino
-    - Comisión: 1.5% sobre transferencias
-    - Moneda base: COP
-    - Tasas: USD→COP=4200, EUR→COP=4500, USD→EUR=0.9200
-
-  Tenant 2: cooperativa-caribe
-    - Comisión: FIJA de 5000 COP
-    - Moneda base: USD
-    - Tasas: USD→COP=4150, EUR→USD=1.0870
-
-Uso:
-  # Con Docker Compose activo:
-  docker compose exec api python scripts/seed_demo.py
-
-  # Localmente (con .env configurado):
-  uv run python scripts/seed_demo.py
-"""
+"""Carga explícitamente los datos ficticios en una base de pruebas aprovisionada."""
 from __future__ import annotations
 
+import argparse
 import asyncio
+from collections.abc import Mapping
+from datetime import datetime, timezone
+from decimal import Decimal
+import logging
 import sys
 import os
+import uuid
 
 # Asegurar que el directorio raíz del proyecto esté en PYTHONPATH
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from decimal import Decimal
-from datetime import datetime, timezone
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-
-from app.core.config import settings
-from app.core.database import Base
+from app.core.database import async_session_factory, engine
 from app.core.security import get_password_hash
+from app.modules.tenants.application.dtos import public_logo_url
 
-# Modelos ORM (importar todos para que Base.metadata los conozca)
 from app.modules.tenants.infrastructure.models import TenantModel
 from app.modules.auth_users.infrastructure.models import PersonModel, UserModel
 from app.modules.accounts.infrastructure.models import AccountModel
-from app.modules.transactions.infrastructure.models import TransactionModel  # noqa: F401
-from app.modules.audit.infrastructure.models import AuditLogModel            # noqa: F401
 
-import uuid
-import logging
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bankos.seed")
 
 
@@ -235,143 +209,174 @@ ACCOUNTS = {
 }
 
 
-from sqlalchemy import select
+DEMO_PASSWORD = "BankOSDemo123!"
+NEW_BANKS = (
+    # Slug, nombre, prefijo de cuenta, clientes, saldos COP/USD/COP, tasa USD a COP.
+    ("bancolombia", "Bancolombia", "31", "Lina Prado Demo", "Teo Rojas Demo", 850000, 240, 25, 4200),
+    ("nu", "Nu", "32", "Alma Ríos Demo", "Bruno Mora Demo", 425000, 80, 12, 4100),
+    ("daviplata", "DaviPlata", "33", "Vera Sol Demo", "Nico Paz Demo", 1230000, 125, 5, 4050),
+    ("uno", "Uno", "34", "Sara Valle Demo", "Iván Lago Demo", 185000, 42, 50, 4300),
+    ("falabella", "Falabella", "35", "Noa Palma Demo", "Elías Nube Demo", 2100000, 350, 15, 4150),
+)
+SEED_LOCK_ID = 0x42616E6B4F53
 
-# ---------------------------------------------------------------------------
-# Lógica de seed
-# ---------------------------------------------------------------------------
 
-async def seed(session: AsyncSession) -> None:
-    # 0. Verificación de idempotencia: si ya existen tenants, no duplicar
-    existing_tenant = await session.execute(select(TenantModel).limit(1))
-    if existing_tenant.scalar_one_or_none() is not None:
-        log.info("ℹ️ Los datos de demostración ya existen en la base de datos (no se requieren cambios).")
-        _print_summary()
-        return
+def _demo_uuid(kind: str, slug: str, value: str = "") -> uuid.UUID:
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"https://bankos.example/demo/{kind}/{slug}/{value}")
 
+
+for slug, name, prefix, first_name, second_name, cop, usd, small_balance, usd_to_cop in NEW_BANKS:
+    TENANTS.append({
+        "id": _demo_uuid("bank", slug),
+        "name": name,
+        "slug": slug,
+        "max_transaction_limit": Decimal("50000000"),
+        "fee_type": "PERCENTAGE",
+        "fee_value": Decimal("1"),
+        "base_currency": "COP",
+        "exchange_rates": {"USD_COP": str(usd_to_cop)},
+        "webhook_url": None,
+    })
+
+    USERS[slug] = [
+        {
+            "id": _demo_uuid("user", slug, str(number)),
+            "email": f"cliente{number}.{slug}@example.com",
+            "password": DEMO_PASSWORD,
+            "full_name": full_name,
+            "role": "cliente",
+        }
+        for number, full_name in enumerate((first_name, second_name), start=1)
+    ]
+    account_cases = (
+        (0, cop, "COP", "ACTIVE"),
+        (0, usd, "USD", "ACTIVE"),
+        (1, small_balance, "COP", "ACTIVE"),
+        (1, 0, "COP", "INACTIVE"),
+    )
+    ACCOUNTS[slug] = [
+        {
+            "id": _demo_uuid("account", slug, str(number)),
+            "account_number": f"{prefix}{number:08d}",
+            "owner_key": USERS[slug][owner]["email"],
+            "balance": Decimal(balance),
+            "currency": currency,
+            "status": status,
+        }
+        for number, (owner, balance, currency, status) in enumerate(account_cases, start=1)
+    ]
+
+
+async def seed(session: AsyncSession, logos: Mapping[str, str] | None = None) -> dict[str, int]:
+    """Agrega filas faltantes y carga logos explícitos únicamente si falta el logo."""
+    await session.execute(text("SELECT pg_advisory_xact_lock(:lock_id)"), {"lock_id": SEED_LOCK_ID})
+    counts = {"banks": 0, "users": 0, "accounts": 0, "logos": 0}
     now = datetime.now(timezone.utc)
 
-    # 1. Tenants
-    for t_data in TENANTS:
-        slug = t_data["slug"]
-        log.info("→ Creando tenant: %s", slug)
-        tenant = TenantModel(
-            id=t_data["id"],
-            name=t_data["name"],
-            slug=slug,
-            max_transaction_limit=t_data["max_transaction_limit"],
-            fee_type=t_data["fee_type"],
-            fee_value=t_data["fee_value"],
-            base_currency=t_data["base_currency"],
-            exchange_rates=t_data["exchange_rates"],
-            webhook_url=t_data["webhook_url"],
-            is_active=True,
-            directory_enabled=True,
-            created_at=now,
-            updated_at=now,
-        )
-        session.add(tenant)
-    await session.flush()
+    for bank_data in TENANTS:
+        slug = bank_data["slug"]
+        logo_url = public_logo_url((logos or {}).get(slug))
+        bank = await session.scalar(select(TenantModel).where(TenantModel.slug == slug))
+        if bank is None:
+            bank = TenantModel(
+                **bank_data,
+                logo_url=logo_url,
+                is_active=True,
+                directory_enabled=True,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(bank)
+            await session.flush()
+            counts["banks"] += 1
+        elif logo_url is not None and bank.logo_url is None:
+            bank.logo_url = logo_url
+            counts["logos"] += 1
 
-    # 2. Users
-    email_to_user_id: dict[str, uuid.UUID] = {}
-    for t_data in TENANTS:
-        slug = t_data["slug"]
-        for u_data in USERS[slug]:
-            log.info("  → Usuario [%s]: %s", u_data["role"], u_data["email"])
+        users = USERS[slug]
+        existing_users = await session.execute(
+            select(UserModel.email, UserModel.id).where(
+                UserModel.tenant_id == bank.id,
+                UserModel.email.in_([user["email"] for user in users]),
+            )
+        )
+        owners = {email: user_id for email, user_id in existing_users}
+        for user in users:
+            email = user["email"]
+            if email in owners:
+                continue
             person = PersonModel(id=uuid.uuid4())
             session.add(person)
             await session.flush()
-            user = UserModel(
-                id=u_data["id"],
-                tenant_id=t_data["id"],
+            session.add(UserModel(
+                id=user["id"],
+                tenant_id=bank.id,
                 person_id=person.id,
-                email=u_data["email"],
-                hashed_password=get_password_hash(u_data["password"]),
-                full_name=u_data["full_name"],
-                role=u_data["role"],
+                email=email,
+                hashed_password=get_password_hash(user["password"]),
+                full_name=user["full_name"],
+                role=user["role"],
                 is_active=True,
                 created_at=now,
                 updated_at=now,
-            )
-            session.add(user)
-            email_to_user_id[u_data["email"]] = u_data["id"]
-    await session.flush()
+            ))
+            owners[email] = user["id"]
+            counts["users"] += 1
+        await session.flush()
 
-    # 3. Accounts
-    for t_data in TENANTS:
-        slug = t_data["slug"]
-        for a_data in ACCOUNTS[slug]:
-            owner_id = email_to_user_id[a_data["owner_key"]]
-            log.info(
-                "  → Cuenta [%s] %s %s — %s",
-                a_data["status"], a_data["account_number"],
-                a_data["currency"], a_data["balance"],
+        accounts = ACCOUNTS[slug]
+        existing_numbers = set(await session.scalars(
+            select(AccountModel.account_number).where(
+                AccountModel.tenant_id == bank.id,
+                AccountModel.account_number.in_([account["account_number"] for account in accounts]),
             )
-            account = AccountModel(
-                id=a_data["id"],
-                account_number=a_data["account_number"],
-                owner_id=owner_id,
-                tenant_id=t_data["id"],
-                balance=a_data["balance"],
-                currency=a_data["currency"],
-                status=a_data["status"],
+        ))
+        for account in accounts:
+            if account["account_number"] in existing_numbers:
+                continue
+            session.add(AccountModel(
+                id=account["id"],
+                tenant_id=bank.id,
+                account_number=account["account_number"],
+                owner_id=owners[account["owner_key"]],
+                balance=account["balance"],
+                currency=account["currency"],
+                status=account["status"],
                 created_at=now,
                 updated_at=now,
-            )
-            session.add(account)
-    await session.flush()
+            ))
+            counts["accounts"] += 1
 
     await session.commit()
-    log.info("\n✅ Seed completado exitosamente.")
-    _print_summary()
+    return counts
 
 
-def _print_summary() -> None:
-    print("\n" + "=" * 70)
-    print("  BANKOS DEMO — Credenciales de Acceso")
-    print("=" * 70)
-    print("\n[ TENANT 1 ] banco-andino")
-    print("  POST /api/v1/auth/login → { tenant_slug: 'banco-andino', ... }")
-    print("  Admin  : admin@banco-andino.com   / Admin123!")
-    print("  Cliente: juan@banco-andino.com    / Cliente123! → ctas 1000000001 (COP), 1000000002 (USD)")
-    print("  Cliente: jaysir@banco-andino.com  / Cliente123! → ctas 1000000003 (COP), 1000000004 (EUR)")
-    print("  Comisión: 1.5% sobre transferencias")
-    print("\n[ TENANT 2 ] cooperativa-caribe")
-    print("  POST /api/v1/auth/login → { tenant_slug: 'cooperativa-caribe', ... }")
-    print("  Admin  : admin@coop-caribe.com    / Admin123!")
-    print("  Cliente: cliente1@coop-caribe.com / Cliente123! → ctas 2000000001 (USD), 2000000003 (COP)")
-    print("  Cliente: cliente2@coop-caribe.com / Cliente123! → ctas 2000000002 (USD)")
-    print("  Comisión: FIJA 2.5 USD")
-    print("\n  Swagger UI: http://localhost:8000/api/v1/docs")
-    print("=" * 70 + "\n")
+def _parse_logo(value: str) -> tuple[str, str]:
+    slug, separator, raw_url = value.partition("=")
+    logo_url = public_logo_url(raw_url)
+    if not separator or not logo_url or slug not in USERS:
+        raise argparse.ArgumentTypeError("Usa --logo SLUG_DEMO=URL_HTTPS sin credenciales en la URL")
+    return slug, logo_url
 
 
-# ---------------------------------------------------------------------------
-# Punto de entrada
-# ---------------------------------------------------------------------------
-
-async def main() -> None:
-    log.info("Conectando a la base de datos: %s", settings.async_database_url.split("@")[-1])
-
-    engine = create_async_engine(settings.async_database_url, echo=False)
-    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        log.info("Tablas verificadas/creadas.")
-
-    async with session_factory() as session:
-        try:
-            await seed(session)
-        except Exception as exc:
-            await session.rollback()
-            log.error("Error durante el seed: %s", exc)
-            raise
-
-    await engine.dispose()
+async def main(logos: Mapping[str, str]) -> None:
+    log.info("Base de pruebas elegida: host=%s base=%s", engine.url.host, engine.url.database)
+    try:
+        async with async_session_factory() as session:
+            counts = await seed(session, logos)
+        log.info(
+            "Datos agregados: %d bancos, %d usuarios, %d cuentas y %d logos de bancos existentes.",
+            counts["banks"], counts["users"], counts["accounts"], counts["logos"],
+        )
+    finally:
+        await engine.dispose()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--apply", action="store_true", required=True, help="Confirma la carga en la base configurada")
+    parser.add_argument("--logo", action="append", type=_parse_logo, default=[], metavar="SLUG=URL")
+    args = parser.parse_args()
+    asyncio.run(main(dict(args.logo)))
 
