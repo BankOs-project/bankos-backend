@@ -61,6 +61,13 @@ class PostgresUserRepository(UserRepository):
         model = result.scalar_one_or_none()
         return self._to_entity(model) if model else None
 
+    async def get_active_holder_name(self, user_id: uuid.UUID, tenant_id: uuid.UUID) -> str | None:
+        return await self.session.scalar(select(UserModel.full_name).where(
+            UserModel.id == user_id,
+            UserModel.tenant_id == tenant_id,
+            UserModel.is_active.is_(True),
+        ))
+
     async def get_by_email_and_tenant(self, email: str, tenant_id: uuid.UUID) -> User | None:
         stmt = select(UserModel).where(
             UserModel.email == email.strip().lower(),

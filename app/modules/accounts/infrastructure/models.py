@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from decimal import Decimal
 import uuid
-from sqlalchemy import DateTime, ForeignKey, Index, Numeric, String, UniqueConstraint
+from sqlalchemy import DateTime, ForeignKey, Index, Numeric, String, UniqueConstraint, false
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -61,6 +61,9 @@ class AccountModel(Base):
         onupdate=lambda: datetime.now(timezone.utc),
         nullable=False,
     )
+    reactivated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    can_deactivate_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    requires_admin_reactivation: Mapped[bool] = mapped_column(server_default=false())
 
     __table_args__ = (
         UniqueConstraint("tenant_id", "account_number", name="uq_tenant_account_number"),

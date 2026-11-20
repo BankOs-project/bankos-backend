@@ -2,12 +2,15 @@ from datetime import datetime
 from decimal import Decimal
 import re
 import uuid
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, case, func, literal, or_, select, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import BankOSException, IdempotencyKeyReusedException
+from app.modules.accounts.domain.entities import AccountStatus
 from app.modules.accounts.infrastructure.models import AccountModel
-from app.modules.transactions.domain.entities import OperationType, Transaction, TransactionStatus
+from app.modules.transactions.domain.entities import (
+    FinancialTotals, OperationType, Transaction, TransactionStatus, TransferMode,
+)
 from app.modules.transactions.domain.repositories import TransactionRepository
 from app.modules.transactions.infrastructure.models import TransactionModel
 
@@ -19,11 +22,100 @@ def _scoped_key(user_id: uuid.UUID, key: str) -> str:
     return f"actor:{user_id.hex}:{key}"
 
 
+def _owner_accounts(tenant_id: uuid.UUID, owner_id: uuid.UUID, account_number: str | None):
+    stmt = select(AccountModel).where(AccountModel.tenant_id == tenant_id, AccountModel.owner_id == owner_id)
+    if account_number:
+        stmt = stmt.where(AccountModel.account_number == account_number)
+    return stmt
+
+
+def _in_period(start_date: datetime | None, end_date: datetime | None):
+    if start_date is not None:
+        yield TransactionModel.created_at >= start_date
+    if end_date is not None:
+        yield TransactionModel.created_at <= end_date
+
+
 class PostgresTransactionRepository(TransactionRepository):
     """Implementación de persistencia para el historial de transacciones financieras."""
 
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
+
+    async def summarize_owner_accounts(
+        self,
+        tenant_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        start_date: datetime,
+        end_date: datetime,
+        account_number: str | None = None,
+    ) -> list[FinancialTotals]:
+        owned = _owner_accounts(tenant_id, owner_id, account_number).with_only_columns(
+            AccountModel.account_number, AccountModel.currency, AccountModel.status, AccountModel.balance,
+        ).cte("summary_accounts")
+        source = owned.alias("owned_source")
+        destination = owned.alias("owned_destination")
+        has_source = source.c.account_number.is_not(None)
+        has_destination = destination.c.account_number.is_not(None)
+        tx = TransactionModel
+        movements = (
+            select(
+                tx.operation_type,
+                tx.original_currency, tx.destination_currency,
+                tx.original_amount, tx.converted_amount, tx.fee_charged,
+                has_source.label("has_source"), has_destination.label("has_destination"),
+            )
+            .select_from(tx)
+            .outerjoin(source, source.c.account_number == tx.source_account_number)
+            .outerjoin(destination, destination.c.account_number == tx.destination_account_number)
+            .where(
+                tx.tenant_id == tenant_id,
+                tx.status == TransactionStatus.SUCCESS.value,
+                *_in_period(start_date, end_date),
+                or_(has_source, has_destination),
+            )
+            .cte("summary_movements")
+        )
+        movement = movements.c
+        own_transfer = and_(
+            movement.operation_type == OperationType.TRANSFER.value,
+            movement.has_source,
+            movement.has_destination,
+        )
+        zero = literal(Decimal("0.0000"))
+        contributions = union_all(
+            select(
+                owned.c.currency,
+                case(
+                    (owned.c.status == AccountStatus.ACTIVE.value, owned.c.balance),
+                    else_=zero,
+                ).label("available_balance"),
+                zero.label("income"),
+                zero.label("expenses"),
+            ),
+            select(movement.destination_currency, zero, movement.converted_amount, zero).where(
+                movement.has_destination,
+                movement.operation_type.in_((OperationType.DEPOSIT.value, OperationType.TRANSFER.value)),
+                ~own_transfer,
+            ),
+            select(
+                movement.original_currency, zero, zero,
+                case((own_transfer, zero), else_=movement.original_amount) + movement.fee_charged,
+            ).where(
+                movement.has_source,
+                movement.operation_type.in_((OperationType.WITHDRAWAL.value, OperationType.TRANSFER.value)),
+            ),
+        ).subquery()
+        amounts = contributions.c
+        rows = await self.session.execute(
+            select(
+                amounts.currency,
+                func.sum(amounts.available_balance),
+                func.sum(amounts.income),
+                func.sum(amounts.expenses),
+            ).group_by(amounts.currency).order_by(amounts.currency)
+        )
+        return [FinancialTotals(*row) for row in rows]
 
     def _to_entity(self, model: TransactionModel) -> Transaction:
         scoped_key = _STORED_KEY.fullmatch(model.idempotency_key)
@@ -45,6 +137,8 @@ class PostgresTransactionRepository(TransactionRepository):
             created_at=model.created_at,
             actor_user_id=model.actor_user_id,
             failure_code=model.failure_code,
+            transfer_mode=TransferMode(model.transfer_mode) if model.transfer_mode else None,
+            transfer_reference=model.transfer_reference,
         )
 
     async def create(self, transaction: Transaction) -> Transaction:
@@ -68,6 +162,8 @@ class PostgresTransactionRepository(TransactionRepository):
             created_at=transaction.created_at,
             actor_user_id=transaction.actor_user_id,
             failure_code=transaction.failure_code,
+            transfer_mode=transaction.transfer_mode.value if transaction.transfer_mode else None,
+            transfer_reference=transaction.transfer_reference,
         )
         self.session.add(model)
         await self.session.flush()
@@ -126,10 +222,7 @@ class PostgresTransactionRepository(TransactionRepository):
             )
         if operation_type:
             base_filter.append(TransactionModel.operation_type == operation_type.value)
-        if start_date:
-            base_filter.append(TransactionModel.created_at >= start_date)
-        if end_date:
-            base_filter.append(TransactionModel.created_at <= end_date)
+        base_filter.extend(_in_period(start_date, end_date))
 
         count_stmt = select(func.count()).select_from(TransactionModel).where(*base_filter)
         count_res = await self.session.execute(count_stmt)
@@ -157,12 +250,9 @@ class PostgresTransactionRepository(TransactionRepository):
         start_date: datetime | None = None,
         end_date: datetime | None = None,
     ) -> tuple[list[Transaction], int]:
-        account_numbers = select(AccountModel.account_number).where(
-            AccountModel.tenant_id == tenant_id,
-            AccountModel.owner_id == owner_id,
+        account_numbers = _owner_accounts(tenant_id, owner_id, account_number).with_only_columns(
+            AccountModel.account_number,
         )
-        if account_number:
-            account_numbers = account_numbers.where(AccountModel.account_number == account_number)
 
         matches_account = or_(
             TransactionModel.source_account_number.in_(account_numbers),
@@ -185,10 +275,7 @@ class PostgresTransactionRepository(TransactionRepository):
 
         if operation_type:
             base_filter.append(TransactionModel.operation_type == operation_type.value)
-        if start_date:
-            base_filter.append(TransactionModel.created_at >= start_date)
-        if end_date:
-            base_filter.append(TransactionModel.created_at <= end_date)
+        base_filter.extend(_in_period(start_date, end_date))
 
         count_stmt = select(func.count()).select_from(TransactionModel).where(*base_filter)
         count_res = await self.session.execute(count_stmt)

@@ -1,11 +1,23 @@
 from abc import ABC, abstractmethod
 from datetime import datetime
 import uuid
-from app.modules.transactions.domain.entities import OperationType, Transaction
+from app.modules.transactions.domain.entities import FinancialTotals, OperationType, Transaction
 
 
 class TransactionRepository(ABC):
     """Contrato del repositorio para la persistencia y consulta del historial de transacciones."""
+
+    @abstractmethod
+    async def summarize_owner_accounts(
+        self,
+        tenant_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        start_date: datetime,
+        end_date: datetime,
+        account_number: str | None = None,
+    ) -> list[FinancialTotals]:
+        """Agrega los saldos actuales y los movimientos confirmados del titular."""
+        pass
 
     @abstractmethod
     async def create(self, transaction: Transaction) -> Transaction:

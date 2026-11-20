@@ -1,4 +1,7 @@
+from datetime import datetime, timedelta, timezone
 import uuid
+
+from app.core.config import settings
 from app.core.exceptions import (
     AuthorizationFailedException,
     BankOSException,
@@ -79,20 +82,7 @@ class CreateAccountUseCase:
             )
             await self.audit_repository.record(audit)
 
-        return self._to_dto(saved)
-
-    def _to_dto(self, account: Account) -> AccountResponseDTO:
-        return AccountResponseDTO(
-            id=account.id,
-            account_number=account.account_number,
-            owner_id=account.owner_id,
-            tenant_id=account.tenant_id,
-            balance=account.balance,
-            currency=account.currency,
-            status=account.status,
-            created_at=account.created_at,
-            updated_at=account.updated_at,
-        )
+        return AccountResponseDTO.model_validate(saved, from_attributes=True)
 
 
 class ListAccountsUseCase:
@@ -134,20 +124,7 @@ class ListAccountsUseCase:
                     limit=limit,
                 )
 
-        items = [
-            AccountResponseDTO(
-                id=a.id,
-                account_number=a.account_number,
-                owner_id=a.owner_id,
-                tenant_id=a.tenant_id,
-                balance=a.balance,
-                currency=a.currency,
-                status=a.status,
-                created_at=a.created_at,
-                updated_at=a.updated_at,
-            )
-            for a in accounts
-        ]
+        items = [AccountResponseDTO.model_validate(account, from_attributes=True) for account in accounts]
 
         return PaginatedAccountsResponseDTO(
             total=total,
@@ -157,8 +134,8 @@ class ListAccountsUseCase:
         )
 
 
-class DeactivateAccountUseCase:
-    """Caso de uso para realizar borrado lógico (Soft Delete) y registrar en auditoría inmutable."""
+class ChangeAccountStatusUseCase:
+    """Cambia el estado bajo el mismo bloqueo que usan las operaciones financieras."""
 
     def __init__(
         self,
@@ -174,6 +151,8 @@ class DeactivateAccountUseCase:
         tenant_id: uuid.UUID,
         actor_user_id: uuid.UUID,
         actor_role: UserRole,
+        *,
+        reactivate: bool,
     ) -> AccountResponseDTO:
         account = await self.account_repository.get_for_update(
             account_number=account_number,
@@ -184,47 +163,41 @@ class DeactivateAccountUseCase:
                 f"La cuenta bancaria '{account_number}' no fue encontrada en esta institución"
             )
 
-        # Regla de autorización: si es cliente, debe ser el titular de la cuenta
-        if actor_role == UserRole.CLIENT and account.owner_id != actor_user_id:
-            raise AuthorizationFailedException(
-                "No posee autorización para desactivar una cuenta de la cual no es titular"
-            )
+        administrative = actor_role == UserRole.ADMIN
+        if not administrative and account.owner_id != actor_user_id:
+            raise AuthorizationFailedException("No posee autorización para cambiar el estado de esta cuenta")
 
-        previous_state = {
+        previous = self._audit_state(account)
+        # Leer el reloj del servidor después de obtener el bloqueo de la fila.
+        now = datetime.now(timezone.utc)
+        if reactivate:
+            changed = account.activate(
+                now=now,
+                cooldown=timedelta(hours=settings.ACCOUNT_DEACTIVATION_COOLDOWN_HOURS),
+                administrative=administrative,
+            )
+        else:
+            changed = account.deactivate(now=now, administrative=administrative)
+
+        if changed:
+            account = await self.account_repository.update(account)
+            await self.audit_repository.record(AuditLog.create(
+                tenant_id=tenant_id,
+                user_id=actor_user_id,
+                action="ACCOUNT_REACTIVATED" if reactivate else "ACCOUNT_DEACTIVATED",
+                previous_state=previous,
+                new_state={**self._audit_state(account), "actor_role": actor_role.value},
+            ))
+        return AccountResponseDTO.model_validate(account, from_attributes=True)
+
+    @staticmethod
+    def _audit_state(account: Account) -> dict:
+        return {
             "account_number": account.account_number,
             "status": account.status.value,
             "balance": str(account.balance),
+            "requires_admin_reactivation": account.requires_admin_reactivation,
+            "reactivated_at": account.reactivated_at.isoformat() if account.reactivated_at else None,
+            "can_deactivate_at": account.can_deactivate_at.isoformat() if account.can_deactivate_at else None,
         }
-
-        # Aplicar borrado lógico
-        account.deactivate()
-        updated = await self.account_repository.update(account)
-
-        new_state = {
-            "account_number": updated.account_number,
-            "status": updated.status.value,
-            "balance": str(updated.balance),
-        }
-
-        # Registro obligatorio en auditoría inmutable
-        audit = AuditLog.create(
-            tenant_id=tenant_id,
-            user_id=actor_user_id,
-            action="ACCOUNT_DEACTIVATED",
-            previous_state=previous_state,
-            new_state=new_state,
-        )
-        await self.audit_repository.record(audit)
-
-        return AccountResponseDTO(
-            id=updated.id,
-            account_number=updated.account_number,
-            owner_id=updated.owner_id,
-            tenant_id=updated.tenant_id,
-            balance=updated.balance,
-            currency=updated.currency,
-            status=updated.status,
-            created_at=updated.created_at,
-            updated_at=updated.updated_at,
-        )
 
