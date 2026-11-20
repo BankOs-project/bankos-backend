@@ -95,7 +95,7 @@ class UpdateTenantConfigUseCase:
         dto: UpdateTenantConfigDTO,
         actor_user_id: uuid.UUID,
     ) -> TenantResponseDTO:
-        tenant = await self.tenant_repository.get_by_id(tenant_id)
+        tenant = await self.tenant_repository.get_by_id(tenant_id, for_update=True)
         if not tenant:
             raise TenantNotFoundException(f"No existe el tenant con ID: {tenant_id}")
 

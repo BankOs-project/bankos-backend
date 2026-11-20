@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 import uuid
 
@@ -9,7 +9,7 @@ from app.core.exceptions import (
     TenantNotFoundException,
 )
 from app.core.middlewares.correlation_id import get_correlation_id
-from app.modules.accounts.domain.entities import Account
+from app.modules.accounts.domain.entities import Account, AccountStatus
 from app.modules.accounts.domain.repositories import AccountRepository
 from app.modules.auth_users.domain.entities import UserRole
 from app.modules.tenants.domain.repositories import TenantRepository
@@ -43,7 +43,7 @@ from app.modules.transactions.domain.repositories import (
 # Helpers internos
 # ---------------------------------------------------------------------------
 
-def _tx_to_dto(tx: Transaction) -> TransactionResponseDTO:
+def transaction_to_dto(tx: Transaction) -> TransactionResponseDTO:
     return TransactionResponseDTO(
         id=tx.id,
         tenant_id=tx.tenant_id,
@@ -60,7 +60,65 @@ def _tx_to_dto(tx: Transaction) -> TransactionResponseDTO:
         idempotency_key=tx.idempotency_key,
         correlation_id=tx.correlation_id,
         created_at=tx.created_at,
+        failure_code=tx.failure_code,
     )
+
+
+async def record_rejected_transaction(
+    account_repository: AccountRepository,
+    transaction_repository: TransactionRepository,
+    *,
+    tenant_id: uuid.UUID,
+    actor_user_id: uuid.UUID,
+    actor_role: UserRole,
+    operation_type: OperationType,
+    amount: Decimal,
+    source_account_number: str | None,
+    destination_account_number: str | None,
+    idempotency_key: str,
+    failure_code: str,
+) -> None:
+    async def currency(account_number: str | None, *, transfer_destination: bool = False) -> str:
+        if account_number is None:
+            return "XXX"
+        account = await account_repository.get_by_account_number(
+            account_number=account_number, tenant_id=tenant_id,
+        )
+        if account and (
+            actor_role == UserRole.ADMIN
+            or account.owner_id == actor_user_id
+            or (transfer_destination and account.status == AccountStatus.ACTIVE)
+        ):
+            return account.currency
+        return "XXX"
+
+    is_transfer = operation_type == OperationType.TRANSFER
+    source_currency = (
+        await currency(source_account_number)
+        if source_account_number is not None
+        else await currency(destination_account_number)
+    )
+    destination_currency = (
+        await currency(destination_account_number, transfer_destination=True)
+        if is_transfer else source_currency
+    )
+    await transaction_repository.create(Transaction.create(
+        tenant_id=tenant_id,
+        actor_user_id=actor_user_id,
+        operation_type=operation_type,
+        original_amount=amount,
+        original_currency=source_currency,
+        converted_amount=Decimal("0"),
+        destination_currency=destination_currency,
+        exchange_rate_applied=Decimal("0"),
+        fee_charged=Decimal("0"),
+        idempotency_key=idempotency_key,
+        correlation_id=get_correlation_id() or str(uuid.uuid4()),
+        source_account_number=source_account_number,
+        destination_account_number=destination_account_number,
+        status=TransactionStatus.ERROR,
+        failure_code=failure_code,
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +140,8 @@ class QuoteTransactionUseCase:
         self,
         tenant_id: uuid.UUID,
         dto: QuoteRequestDTO,
+        actor_user_id: uuid.UUID,
+        actor_role: UserRole,
     ) -> QuoteResponseDTO:
         tenant = await self.tenant_repository.get_by_id(tenant_id)
         if not tenant or not tenant.is_active:
@@ -95,6 +155,8 @@ class QuoteTransactionUseCase:
             raise ResourceNotFoundException(
                 f"Cuenta origen '{dto.source_account_number}' no encontrada en esta institución"
             )
+        if actor_role == UserRole.CLIENT and source.owner_id != actor_user_id:
+            raise AuthorizationFailedException("Solo puedes cotizar operaciones desde tus propias cuentas")
         source.ensure_can_operate()
 
         amount = Decimal(str(dto.amount))
@@ -116,7 +178,7 @@ class QuoteTransactionUseCase:
             exchange_rate = get_exchange_rate(source_currency, dest_currency, tenant)
 
         fee = calculate_fee(amount, tenant) if dto.operation_type == OperationType.TRANSFER else Decimal("0.0000")
-        amount_to_debit = amount + fee
+        amount_to_debit = Decimal("0.0000") if dto.operation_type == OperationType.DEPOSIT else amount + fee
         final_amount = apply_conversion(amount, exchange_rate)
 
         return QuoteResponseDTO(
@@ -152,18 +214,11 @@ class DepositUseCase:
         dto: DepositDTO,
         actor_user_id: uuid.UUID,
         actor_role: UserRole,
+        idempotency_key: str,
     ) -> TransactionResponseDTO:
         correlation_id = get_correlation_id() or str(uuid.uuid4())
 
-        # 1. Idempotencia: si ya existe, retornar la respuesta original
-        existing = await self.transaction_repository.get_by_idempotency_key(
-            idempotency_key=dto.idempotency_key,
-            tenant_id=tenant_id,
-        )
-        if existing:
-            return _tx_to_dto(existing)
-
-        # 2. Bloqueo pesimista sobre la cuenta destino
+        # 1. Bloqueo pesimista sobre la cuenta destino
         account = await self.account_repository.get_for_update(
             account_number=dto.account_number,
             tenant_id=tenant_id,
@@ -173,7 +228,7 @@ class DepositUseCase:
                 f"Cuenta '{dto.account_number}' no encontrada en esta institución"
             )
 
-        # 3. Validación de autorización: cliente solo puede depositar en sus propias cuentas
+        # 2. Validación de autorización: cliente solo puede depositar en sus propias cuentas
         if actor_role == UserRole.CLIENT and account.owner_id != actor_user_id:
             raise AuthorizationFailedException(
                 "No posee autorización para depositar en una cuenta de la cual no es titular"
@@ -181,11 +236,11 @@ class DepositUseCase:
 
         amount = Decimal(str(dto.amount))
 
-        # 4. Regla de dominio: cuenta activa + monto positivo (validado en entidad)
+        # 3. Regla de dominio: cuenta activa + monto positivo (validado en entidad)
         account.credit(amount)
         await self.account_repository.update(account)
 
-        # 5. Persistir registro de transacción
+        # 4. Persistir registro de transacción
         tx = Transaction.create(
             tenant_id=tenant_id,
             operation_type=OperationType.DEPOSIT,
@@ -195,18 +250,18 @@ class DepositUseCase:
             destination_currency=account.currency,
             exchange_rate_applied=ONE,
             fee_charged=Decimal("0.0000"),
-            idempotency_key=dto.idempotency_key,
+            idempotency_key=idempotency_key,
             correlation_id=correlation_id,
             source_account_number=None,
             destination_account_number=dto.account_number,
             status=TransactionStatus.SUCCESS,
         )
         saved = await self.transaction_repository.create(tx)
-        return _tx_to_dto(saved)
+        return transaction_to_dto(saved)
 
 
 # ---------------------------------------------------------------------------
-# 3. Retiro
+# 2. Retiro
 # ---------------------------------------------------------------------------
 
 class WithdrawUseCase:
@@ -226,18 +281,11 @@ class WithdrawUseCase:
         dto: WithdrawDTO,
         actor_user_id: uuid.UUID,
         actor_role: UserRole,
+        idempotency_key: str,
     ) -> TransactionResponseDTO:
         correlation_id = get_correlation_id() or str(uuid.uuid4())
 
-        # 1. Idempotencia
-        existing = await self.transaction_repository.get_by_idempotency_key(
-            idempotency_key=dto.idempotency_key,
-            tenant_id=tenant_id,
-        )
-        if existing:
-            return _tx_to_dto(existing)
-
-        # 2. Bloqueo pesimista
+        # 1. Bloqueo pesimista
         account = await self.account_repository.get_for_update(
             account_number=dto.account_number,
             tenant_id=tenant_id,
@@ -247,7 +295,7 @@ class WithdrawUseCase:
                 f"Cuenta '{dto.account_number}' no encontrada en esta institución"
             )
 
-        # 3. Verificar titularidad: clientes solo pueden retirar de sus cuentas propias
+        # 2. Verificar titularidad: clientes solo pueden retirar de sus cuentas propias
         if actor_role == UserRole.CLIENT and account.owner_id != actor_user_id:
             raise AuthorizationFailedException(
                 "No posee autorización para retirar de una cuenta de la cual no es titular"
@@ -255,11 +303,11 @@ class WithdrawUseCase:
 
         amount = Decimal(str(dto.amount))
 
-        # 4. Regla de dominio: valida activa + saldo suficiente
+        # 3. Regla de dominio: valida activa + saldo suficiente
         account.debit(amount)
         await self.account_repository.update(account)
 
-        # 5. Persistir transacción
+        # 4. Persistir transacción
         tx = Transaction.create(
             tenant_id=tenant_id,
             operation_type=OperationType.WITHDRAWAL,
@@ -269,18 +317,18 @@ class WithdrawUseCase:
             destination_currency=account.currency,
             exchange_rate_applied=ONE,
             fee_charged=Decimal("0.0000"),
-            idempotency_key=dto.idempotency_key,
+            idempotency_key=idempotency_key,
             correlation_id=correlation_id,
             source_account_number=dto.account_number,
             destination_account_number=None,
             status=TransactionStatus.SUCCESS,
         )
         saved = await self.transaction_repository.create(tx)
-        return _tx_to_dto(saved)
+        return transaction_to_dto(saved)
 
 
 # ---------------------------------------------------------------------------
-# 4. Transferencia Interna
+# 3. Transferencia Interna
 # ---------------------------------------------------------------------------
 
 class InternalTransferUseCase:
@@ -304,23 +352,16 @@ class InternalTransferUseCase:
         dto: TransferDTO,
         actor_user_id: uuid.UUID,
         actor_role: UserRole,
+        idempotency_key: str,
     ) -> TransactionResponseDTO:
         correlation_id = get_correlation_id() or str(uuid.uuid4())
 
-        # 1. Idempotencia: retornar respuesta original si la clave ya fue procesada
-        existing = await self.transaction_repository.get_by_idempotency_key(
-            idempotency_key=dto.idempotency_key,
-            tenant_id=tenant_id,
-        )
-        if existing:
-            return _tx_to_dto(existing)
-
-        # 2. Cargar configuración del tenant (comisiones, límites, tasas de cambio)
+        # 1. Cargar configuración del tenant (comisiones, límites, tasas de cambio)
         tenant = await self.tenant_repository.get_by_id(tenant_id)
         if not tenant or not tenant.is_active:
             raise TenantNotFoundException()
 
-        # 3. Bloqueo pesimista anti-deadlock: ordenar cuentas ALFABÉTICAMENTE por account_number
+        # 2. Bloqueo pesimista anti-deadlock: ordenar cuentas ALFABÉTICAMENTE por account_number
         #    Esto garantiza que dos transferencias concurrentes entre las mismas cuentas
         #    adquieran los locks siempre en el mismo orden, evitando deadlocks en PostgreSQL.
         ordered_accounts = sorted([
@@ -343,11 +384,11 @@ class InternalTransferUseCase:
         source = locked[dto.source_account_number]
         destination = locked[dto.destination_account_number]
 
-        # 4. Validar que ambas cuentas estén activas
+        # 3. Validar que ambas cuentas estén activas
         source.ensure_can_operate()
         destination.ensure_can_operate()
 
-        # 5. Validar autorización: el cliente solo puede transferir desde sus propias cuentas
+        # 4. Validar autorización: el cliente solo puede transferir desde sus propias cuentas
         if actor_role == UserRole.CLIENT and source.owner_id != actor_user_id:
             raise AuthorizationFailedException(
                 "No posee autorización para transferir desde una cuenta de la cual no es titular"
@@ -355,7 +396,7 @@ class InternalTransferUseCase:
 
         amount = Decimal(str(dto.amount))
 
-        # 6. Validar límite máximo de transacción del tenant
+        # 5. Validar límite máximo de transacción del tenant
         if amount > tenant.max_transaction_limit:
             raise BankOSException(
                 message=(
@@ -366,11 +407,11 @@ class InternalTransferUseCase:
                 status_code=422,
             )
 
-        # 7. Calcular comisión con Decimal puro
+        # 6. Calcular comisión con Decimal puro
         fee = calculate_fee(amount, tenant)
         total_to_debit = amount + fee
 
-        # 8. Verificar saldo suficiente para monto + comisión (antes del lock dominio)
+        # 7. Verificar saldo suficiente para monto + comisión (antes del lock dominio)
         if source.balance < total_to_debit:
             from app.core.exceptions import InsufficientFundsException
             raise InsufficientFundsException(
@@ -381,19 +422,19 @@ class InternalTransferUseCase:
                 )
             )
 
-        # 9. Calcular conversión de divisa si las cuentas tienen monedas distintas
+        # 8. Calcular conversión de divisa si las cuentas tienen monedas distintas
         exchange_rate = get_exchange_rate(source.currency, destination.currency, tenant)
         converted_amount = apply_conversion(amount, exchange_rate)
 
-        # 10. Aplicar movimientos en las entidades de dominio (incluye validación interna)
+        # 9. Aplicar movimientos en las entidades de dominio (incluye validación interna)
         source.debit(total_to_debit)
         destination.credit(converted_amount)
 
-        # 11. Persistir cambios en base de datos dentro de la misma transacción ACID
+        # 10. Persistir cambios en base de datos dentro de la misma transacción ACID
         await self.account_repository.update(source)
         await self.account_repository.update(destination)
 
-        # 12. Crear y persistir el registro de la transacción
+        # 11. Crear y persistir el registro de la transacción
         tx = Transaction.create(
             tenant_id=tenant_id,
             operation_type=OperationType.TRANSFER,
@@ -403,7 +444,7 @@ class InternalTransferUseCase:
             destination_currency=destination.currency,
             exchange_rate_applied=exchange_rate,
             fee_charged=fee,
-            idempotency_key=dto.idempotency_key,
+            idempotency_key=idempotency_key,
             correlation_id=correlation_id,
             source_account_number=source.account_number,
             destination_account_number=destination.account_number,
@@ -411,7 +452,7 @@ class InternalTransferUseCase:
         )
         saved = await self.transaction_repository.create(tx)
 
-        return _tx_to_dto(saved)
+        return transaction_to_dto(saved)
 
 
 # ---------------------------------------------------------------------------
@@ -441,27 +482,32 @@ class GetTransactionHistoryUseCase:
         start_date: datetime | None = None,
         end_date: datetime | None = None,
     ) -> PaginatedTransactionsResponseDTO:
-        if actor_role == UserRole.CLIENT:
-            # Obtener solo los account_numbers propios del cliente
-            user_accounts, _ = await self.account_repository.list_by_owner(
-                owner_id=actor_user_id,
-                tenant_id=tenant_id,
-                skip=0,
-                limit=1000,
+        if start_date is not None and start_date.tzinfo is None:
+            start_date = start_date.replace(tzinfo=timezone.utc)
+        if end_date is not None and end_date.tzinfo is None:
+            end_date = end_date.replace(tzinfo=timezone.utc)
+        if start_date is not None and end_date is not None and start_date > end_date:
+            raise BankOSException(
+                message="start_date debe ser anterior o igual a end_date",
+                internal_code="INVALID_DATE_RANGE",
+                status_code=422,
             )
-            user_account_numbers = [a.account_number for a in user_accounts]
 
-            # Si se especifica un account_number, verificar que pertenezca al cliente
-            if account_number and account_number not in user_account_numbers:
-                raise AuthorizationFailedException(
-                    "No posee autorización para consultar el historial de esta cuenta"
+        if actor_role == UserRole.CLIENT:
+            if account_number:
+                account = await self.account_repository.get_by_account_number(
+                    account_number=account_number,
+                    tenant_id=tenant_id,
                 )
-
-            filter_numbers = [account_number] if account_number else user_account_numbers
+                if not account or account.owner_id != actor_user_id:
+                    raise AuthorizationFailedException(
+                        "No posee autorización para consultar el historial de esta cuenta"
+                    )
 
             txs, total = await self.transaction_repository.list_by_owner_accounts(
                 tenant_id=tenant_id,
-                account_numbers=filter_numbers,
+                owner_id=actor_user_id,
+                account_number=account_number,
                 skip=skip,
                 limit=limit,
                 operation_type=operation_type,
@@ -484,5 +530,5 @@ class GetTransactionHistoryUseCase:
             total=total,
             skip=skip,
             limit=limit,
-            items=[_tx_to_dto(tx) for tx in txs],
+            items=[transaction_to_dto(tx) for tx in txs],
         )

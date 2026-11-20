@@ -1,3 +1,4 @@
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 import uuid
 from app.core.config import settings
@@ -17,6 +18,7 @@ from app.modules.auth_users.application.dtos import (
 )
 from app.modules.auth_users.domain.entities import User
 from app.modules.auth_users.domain.repositories import UserRepository
+from app.modules.tenants.domain.entities import Tenant
 from app.modules.tenants.domain.repositories import TenantRepository
 
 
@@ -27,13 +29,29 @@ class AuthenticateUserUseCase:
         self,
         tenant_repository: TenantRepository,
         user_repository: UserRepository,
+        check_account_limit: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> None:
         self.tenant_repository = tenant_repository
         self.user_repository = user_repository
+        self.check_account_limit = check_account_limit
+
+    async def _resolve_tenant(self, dto: LoginRequestDTO) -> Tenant | None:
+        if dto.bank_id is None:
+            return await self.tenant_repository.get_by_slug(dto.tenant_slug) if dto.tenant_slug else None
+        if dto.tenant_slug is not None:
+            return None
+        try:
+            public_id = uuid.UUID(dto.bank_id.strip())
+        except ValueError:
+            return None
+        return await self.tenant_repository.get_by_public_id(public_id)
 
     async def execute(self, dto: LoginRequestDTO) -> TokenResponseDTO:
         # 1. Validar existencia y estado del tenant
-        tenant = await self.tenant_repository.get_by_slug(dto.tenant_slug)
+        tenant = await self._resolve_tenant(dto)
+        if self.check_account_limit is not None:
+            selector = tenant.slug if tenant else dto.tenant_slug or f"public:{dto.bank_id or ''}"
+            await self.check_account_limit(selector, dto.email)
         if not tenant or not tenant.is_active:
             raise AuthenticationFailedException("Institución bancaria o credenciales no válidas")
 

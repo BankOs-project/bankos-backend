@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from decimal import Decimal
 import uuid
-from sqlalchemy import DateTime, Index, Numeric, String
+from sqlalchemy import DateTime, Index, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -23,6 +23,8 @@ class TransactionModel(Base):
         nullable=False,
         index=True,
     )
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))
+    failure_code: Mapped[str | None] = mapped_column(String(100))
     operation_type: Mapped[str] = mapped_column(
         String(20),
         nullable=False,
@@ -92,4 +94,18 @@ class TransactionModel(Base):
         Index("ix_tx_tenant_source_acc", "tenant_id", "source_account_number"),
         Index("ix_tx_tenant_dest_acc", "tenant_id", "destination_account_number"),
     )
+
+
+class IdempotencyReceiptModel(Base):
+    """Respuesta HTTP confirmada en la misma transacción que el movimiento."""
+
+    __tablename__ = "transaction_idempotency_receipts"
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    key: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    path: Mapped[str] = mapped_column(String(255))
+    status_code: Mapped[int]
+    body: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 

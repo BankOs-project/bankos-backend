@@ -7,6 +7,12 @@ from pydantic import BaseModel, Field, HttpUrl, field_validator
 from app.modules.tenants.domain.entities import FeeType
 
 
+class PublicBankDTO(BaseModel):
+    bank_id: uuid.UUID
+    name: str
+    logo_url: str | None
+
+
 class CreateTenantDTO(BaseModel):
     """Esquema de solicitud para el registro de un nuevo tenant institucional."""
 

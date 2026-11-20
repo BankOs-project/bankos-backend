@@ -1,151 +1,175 @@
-"""
-Dependencia de idempotencia basada en Redis para operaciones financieras mutables en BankOS.
-
-Flujo:
-1. Lee el header Idempotency-Key  → 400 si falta.
-2. Construye la clave Redis: idemp:{tenant_id}:{user_id}:{idempotency_key}
-3. SET NX con valor "PROCESSING" y TTL 24h:
-   - Falla NX → clave existe. Lee el valor actual:
-       "PROCESSING"  → 409 Conflict  (misma petición en curso)
-       JSON payload  → retorna la respuesta cacheada exactamente (status + body)
-4. Si NX fue exitoso, almacena token para que el router lo llame con `store_response()`.
-"""
-from __future__ import annotations
-
+"""Idempotencia de operaciones financieras con PostgreSQL y caché Redis."""
+import asyncio
+from collections.abc import AsyncIterator
+from datetime import datetime, timedelta, timezone
+from hashlib import blake2b
 import json
 import logging
-from typing import Any
+import uuid
 
 from fastapi import Depends, Header, Request, Response
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.database import async_session_factory
+from app.core.exceptions import (
+    BankOSException,
+    IdempotencyConflictException,
+    IdempotencyKeyReusedException,
+)
 from app.core.redis import get_redis
-from app.core.responses import error_response
+from app.modules.auth_users.presentation.dependencies import AuthenticatedUser, get_current_user
+from app.modules.transactions.infrastructure.models import IdempotencyReceiptModel
 
 logger = logging.getLogger("bankos.idempotency")
 
 IDEMPOTENCY_HEADER = "Idempotency-Key"
-IDEMPOTENCY_TTL_SECONDS = 86_400  # 24 horas
-PROCESSING_VALUE = "PROCESSING"
-
-
-def _build_key(tenant_id: str, user_id: str, idempotency_key: str) -> str:
-    return f"idemp:{tenant_id}:{user_id}:{idempotency_key}"
+IDEMPOTENCY_WINDOW = timedelta(hours=24)
+CACHE_TIMEOUT_SECONDS = 1
 
 
 class IdempotencyContext:
-    """Objeto que el router usa para cachear la respuesta una vez procesada."""
-
     def __init__(
         self,
+        session: AsyncSession,
         redis: Redis,
-        redis_key: str,
-        idempotency_key: str,
-        cached_response: Response | None,
+        user: AuthenticatedUser,
+        key: uuid.UUID,
+        path: str,
     ) -> None:
+        self.session = session
         self.redis = redis
-        self.redis_key = redis_key
-        self.idempotency_key = idempotency_key
-        self.cached_response = cached_response  # None → hay que ejecutar el caso de uso
+        self.user = user
+        self.key = key
+        self.path = path
+        self.cache_key = f"idemp:receipt:v1:{user.tenant_id}:{user.user_id}:{key}"
 
-    async def store_response(self, status_code: int, body: dict[str, Any]) -> None:
-        """Persiste el resultado final en Redis para peticiones futuras con la misma clave."""
-        payload = json.dumps({"status_code": status_code, "body": body})
-        await self.redis.setex(self.redis_key, IDEMPOTENCY_TTL_SECONDS, payload)
+    @property
+    def idempotency_key(self) -> str:
+        return str(self.key)
+
+    def _replay(self, path: str, status_code: int, body: str) -> Response:
+        if path != self.path:
+            raise IdempotencyKeyReusedException()
+        return Response(content=body, status_code=status_code, media_type="application/json")
+
+    async def replay_or_lock(self, body_key: str | None) -> Response | None:
+        if body_key is not None and body_key.lower() != self.idempotency_key:
+            raise BankOSException(
+                message="La clave de idempotencia del cuerpo debe coincidir con Idempotency-Key",
+                internal_code="IDEMPOTENCY_KEY_MISMATCH",
+                status_code=422,
+            )
+
+        try:
+            async with asyncio.timeout(CACHE_TIMEOUT_SECONDS):
+                cached = await self.redis.get(self.cache_key)
+            if cached is not None:
+                receipt = json.loads(cached)
+                if datetime.fromisoformat(receipt["expires_at"]) > datetime.now(timezone.utc):
+                    return self._replay(receipt["path"], receipt["status_code"], receipt["body"])
+        except (RedisError, TimeoutError, ValueError, TypeError, KeyError):
+            logger.warning("No se pudo leer el comprobante desde Redis", exc_info=True)
+
+        # PostgreSQL libera el lock al confirmar, revertir o perder la conexión.
+        # Redis puede perder su contenido sin perder la exclusión ni el comprobante.
+        identity = self.user.tenant_id.bytes + self.user.user_id.bytes + self.key.bytes
+        lock_key = blake2b(identity, digest_size=8).digest()
+        lock_id = int.from_bytes(lock_key, byteorder="big", signed=True)
+        acquired = await self.session.scalar(select(func.pg_try_advisory_xact_lock(lock_id)))
+
+        receipt = await self.session.scalar(
+            select(IdempotencyReceiptModel).where(
+                IdempotencyReceiptModel.tenant_id == self.user.tenant_id,
+                IdempotencyReceiptModel.user_id == self.user.user_id,
+                IdempotencyReceiptModel.key == self.key,
+                IdempotencyReceiptModel.expires_at > func.clock_timestamp(),
+            )
+        )
+        if receipt is None:
+            if not acquired:
+                raise IdempotencyConflictException()
+            return None
+
+        response = self._replay(receipt.path, receipt.status_code, receipt.body)
+        receipt_expires_at = receipt.expires_at
+        await self.session.rollback()  # El camino de lectura ya puede liberar el lock.
+        await self._cache(response, receipt_expires_at)
+        return response
+
+    async def confirm(self, response: Response, *, expires_at: datetime | None = None) -> Response:
+        if expires_at is None:
+            db_time = await self.session.scalar(select(func.clock_timestamp()))
+            expires_at = db_time + IDEMPOTENCY_WINDOW
+
+        receipt = insert(IdempotencyReceiptModel).values(
+            tenant_id=self.user.tenant_id,
+            user_id=self.user.user_id,
+            key=self.key,
+            path=self.path,
+            status_code=response.status_code,
+            body=response.body.decode("utf-8"),
+            expires_at=expires_at,
+        )
+        await self.session.execute(
+            receipt.on_conflict_do_update(
+                index_elements=["tenant_id", "user_id", "key"],
+                set_={
+                    "path": receipt.excluded.path,
+                    "status_code": receipt.excluded.status_code,
+                    "body": receipt.excluded.body,
+                    "expires_at": receipt.excluded.expires_at,
+                },
+            )
+        )
+        await self.session.commit()
+        await self._cache(response, expires_at)
+        return response
+
+    async def _cache(self, response: Response, expires_at: datetime) -> None:
+        if expires_at <= datetime.now(timezone.utc):
+            return
+        payload = json.dumps({
+            "path": self.path,
+            "status_code": response.status_code,
+            "body": response.body.decode("utf-8"),
+            "expires_at": expires_at.isoformat(),
+        })
+        try:
+            async with asyncio.timeout(CACHE_TIMEOUT_SECONDS):
+                await self.redis.set(self.cache_key, payload, pxat=int(expires_at.timestamp() * 1000))
+        except (RedisError, TimeoutError):
+            logger.warning("No se pudo cachear el comprobante confirmado", exc_info=True)
 
 
 async def get_idempotency_context(
     request: Request,
+    current_user: AuthenticatedUser = Depends(get_current_user),
     redis: Redis = Depends(get_redis),
-) -> IdempotencyContext:
-    """
-    Dependencia FastAPI que implementa el protocolo completo de idempotencia en Redis.
-    Inyectar en endpoints POST mutables.
-    """
-    # 1. Leer clave de idempotencia del header (obligatorio)
-    idempotency_key = request.headers.get(IDEMPOTENCY_HEADER, "").strip()
-    if not idempotency_key:
-        from fastapi.responses import JSONResponse
-        raise _missing_key_error()
-
-    # 2. Extraer identidad del request.state (puesta por get_current_user en el router)
-    #    Usamos strings vacíos como fallback; si no hay usuario el endpoint lo rechazará antes.
-    tenant_id = str(getattr(request.state, "tenant_id", "anonymous"))
-    user_id = str(getattr(request.state, "user_id", "anonymous"))
-
-    redis_key = _build_key(tenant_id, user_id, idempotency_key)
-
-    # 3. Intentar reservar la clave atómicamente (SET NX EX)
-    acquired = await redis.set(redis_key, PROCESSING_VALUE, ex=IDEMPOTENCY_TTL_SECONDS, nx=True)
-
-    if acquired:
-        # Clave recién creada → proceder con el caso de uso normalmente
-        return IdempotencyContext(
-            redis=redis,
-            redis_key=redis_key,
-            idempotency_key=idempotency_key,
-            cached_response=None,
+    key: str | None = Header(None, alias=IDEMPOTENCY_HEADER),
+) -> AsyncIterator[IdempotencyContext]:
+    if not key or not key.strip():
+        raise BankOSException(
+            message="El encabezado Idempotency-Key es obligatorio",
+            internal_code="MISSING_IDEMPOTENCY_KEY",
+            status_code=400,
         )
 
-    # 4. La clave ya existía → leer su estado actual
-    existing_value: str | None = await redis.get(redis_key)
-
-    if existing_value == PROCESSING_VALUE or existing_value is None:
-        # En proceso concurrente → 409 Conflict
-        from fastapi import HTTPException
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "success": False,
-                "internal_code": "IDEMPOTENCY_IN_PROGRESS",
-                "message": (
-                    "Esta transaccion ya se encuentra en proceso de ejecucion. "
-                    "Espere a que concluya antes de reintentar."
-                ),
-                "data": {"idempotency_key": idempotency_key},
-            },
-        )
-
-    # 5. Respuesta cacheada (COMPLETED) → deserializar y devolver
+    key = key.strip()
     try:
-        cached = json.loads(existing_value)
-        from fastapi.responses import JSONResponse
-        cached_resp = JSONResponse(
-            status_code=cached["status_code"],
-            content=cached["body"],
-        )
-        return IdempotencyContext(
-            redis=redis,
-            redis_key=redis_key,
-            idempotency_key=idempotency_key,
-            cached_response=cached_resp,
-        )
-    except (json.JSONDecodeError, KeyError) as exc:
-        logger.warning("Idempotency cache corrupted for key=%s: %s", redis_key, exc)
-        # Si el caché está corrupto, permitir re-ejecución borrando la clave
-        await redis.delete(redis_key)
-        await redis.set(redis_key, PROCESSING_VALUE, ex=IDEMPOTENCY_TTL_SECONDS, nx=True)
-        return IdempotencyContext(
-            redis=redis,
-            redis_key=redis_key,
-            idempotency_key=idempotency_key,
-            cached_response=None,
-        )
+        parsed_key = uuid.UUID(key)
+        if parsed_key.version != 4 or str(parsed_key) != key.lower():
+            raise ValueError
+    except ValueError as exc:
+        raise BankOSException(
+            message="Idempotency-Key debe ser un UUID v4 en su formato estándar",
+            internal_code="INVALID_IDEMPOTENCY_KEY",
+            status_code=422,
+        ) from exc
 
-
-def _missing_key_error():
-    """Genera la excepción estándar cuando falta el header Idempotency-Key."""
-    from fastapi import HTTPException
-    return HTTPException(
-        status_code=400,
-        detail={
-            "success": False,
-            "internal_code": "MISSING_IDEMPOTENCY_KEY",
-            "message": (
-                f"El encabezado '{IDEMPOTENCY_HEADER}' es obligatorio para operaciones financieras mutables. "
-                "Genera un UUID v4 en el cliente y reenvíalo en cada reintento."
-            ),
-            "data": None,
-        },
-    )
+    async with async_session_factory() as session:
+        yield IdempotencyContext(session, redis, current_user, parsed_key, request.url.path)
 

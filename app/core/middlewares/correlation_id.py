@@ -86,7 +86,7 @@ class CorrelationIdMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         header_val = request.headers.get(CORRELATION_ID_HEADER, "").strip()
-        correlation_id = header_val if header_val else str(uuid.uuid4())
+        correlation_id = header_val if 0 < len(header_val) <= 100 else str(uuid.uuid4())
 
         # Guardar en ContextVar asíncrona y en request.state
         token = correlation_id_ctx.set(correlation_id)

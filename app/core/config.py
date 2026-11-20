@@ -1,5 +1,6 @@
 from typing import Any
-from pydantic import Field, field_validator
+from urllib.parse import quote
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -28,6 +29,8 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "bankos-development-secret-key-change-this-in-production-min-32-chars-long!"
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+    RESEND_API_KEY: SecretStr | None = None
+    REGISTRATION_EMAIL_FROM: str | None = None
 
     # Base de Datos Relacional (PostgreSQL 15)
     POSTGRES_SERVER: str = "localhost"
@@ -36,6 +39,8 @@ class Settings(BaseSettings):
     POSTGRES_PASSWORD: str = "postgres_secure_password"
     POSTGRES_DB: str = "bankos_db"
     DATABASE_URL: str | None = None
+    DATABASE_MANAGED_SCHEMA: bool = False
+    RATE_LIMIT_TRUSTED_PROXIES: str = ""
 
     # Motor en Memoria (Redis 7)
     REDIS_HOST: str = "localhost"
@@ -65,8 +70,8 @@ class Settings(BaseSettings):
                 return self.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
             return self.DATABASE_URL
         return (
-            f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
-            f"@{self.POSTGRES_SERVER}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+            f"postgresql+asyncpg://{quote(self.POSTGRES_USER, safe='')}:{quote(self.POSTGRES_PASSWORD, safe='')}"
+            f"@{self.POSTGRES_SERVER}:{self.POSTGRES_PORT}/{quote(self.POSTGRES_DB, safe='')}"
         )
 
     @property

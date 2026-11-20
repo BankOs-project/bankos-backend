@@ -2,12 +2,17 @@ from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.exceptions import AuthenticationFailedException
+from app.core.middlewares.rate_limit import enforce_login_account_limit
 from app.core.responses import success_response
 from app.modules.audit.infrastructure.repositories import PostgresAuditRepository
 from app.modules.auth_users.application.dtos import (
     CreateUserDTO,
     LoginRequestDTO,
+    StartRegistrationDTO,
+    VerifyRegistrationDTO,
 )
+from app.modules.auth_users.application.registration import REGISTRATION_TTL_SECONDS, RegistrationService
 from app.modules.auth_users.application.use_cases import (
     AuthenticateUserUseCase,
     CreateUserUseCase,
@@ -16,11 +21,41 @@ from app.modules.auth_users.infrastructure.repositories import PostgresUserRepos
 from app.modules.auth_users.presentation.dependencies import (
     AuthenticatedUser,
     get_current_user,
+    get_optional_registration_actor,
     require_admin_role,
 )
 from app.modules.tenants.infrastructure.repositories import PostgresTenantRepository
 
 router = APIRouter(prefix="/auth", tags=["Autenticación y Usuarios"])
+
+
+@router.post("/register", status_code=status.HTTP_202_ACCEPTED)
+async def start_registration(
+    dto: StartRegistrationDTO,
+    actor: AuthenticatedUser | None = Depends(get_optional_registration_actor),
+    session: AsyncSession = Depends(get_db),
+):
+    registration_id = await RegistrationService(session).start(dto, actor)
+    return success_response(
+        data={"registration_id": str(registration_id), "expires_in": REGISTRATION_TTL_SECONDS},
+        message="Completa la verificación de correo para continuar",
+        internal_code="REGISTRATION_PENDING",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+
+
+@router.post("/register/verify", status_code=status.HTTP_201_CREATED)
+async def verify_registration(
+    dto: VerifyRegistrationDTO,
+    actor: AuthenticatedUser | None = Depends(get_optional_registration_actor),
+    session: AsyncSession = Depends(get_db),
+):
+    await RegistrationService(session).verify(dto, actor)
+    return success_response(
+        message="Registro verificado. Ya puedes iniciar sesión en el banco elegido",
+        internal_code="REGISTRATION_VERIFIED",
+        status_code=status.HTTP_201_CREATED,
+    )
 
 
 @router.post(
@@ -32,10 +67,10 @@ async def login(
     dto: LoginRequestDTO,
     session: AsyncSession = Depends(get_db),
 ):
-    """Autentica a un usuario dentro del contexto de su tenant_slug y genera un JWT firmado."""
+    """Autentica dentro del banco seleccionado y genera un JWT firmado."""
     tenant_repo = PostgresTenantRepository(session)
     user_repo = PostgresUserRepository(session)
-    use_case = AuthenticateUserUseCase(tenant_repo, user_repo)
+    use_case = AuthenticateUserUseCase(tenant_repo, user_repo, enforce_login_account_limit)
 
     result = await use_case.execute(dto)
     return success_response(
@@ -65,6 +100,7 @@ async def create_user(
         dto=dto,
         actor_user_id=admin_user.user_id,
     )
+    await session.commit()
     return success_response(
         data=result.model_dump(mode="json"),
         message="Usuario creado exitosamente dentro del tenant",
@@ -84,16 +120,8 @@ async def get_my_profile(
     """Retorna los datos de sesión y tenant del usuario en curso."""
     user_repo = PostgresUserRepository(session)
     user = await user_repo.get_by_id(current_user.user_id)
-    if not user:
-        return success_response(
-            data={
-                "user_id": str(current_user.user_id),
-                "tenant_id": str(current_user.tenant_id),
-                "role": current_user.role.value,
-            },
-            message="Sesión activa",
-            internal_code="USER_PROFILE",
-        )
+    if not user or user.tenant_id != current_user.tenant_id or not user.is_active:
+        raise AuthenticationFailedException("La sesión no corresponde a un usuario activo")
 
     return success_response(
         data={
