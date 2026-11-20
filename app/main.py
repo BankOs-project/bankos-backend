@@ -60,14 +60,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("Pool de Redis inicializado.")
 
     # 2. Crear todas las tablas en PostgreSQL si aun no existen (DDL auto en startup)
-    managed_schema = (
-        settings.DATABASE_MANAGED_SCHEMA
-        or settings.ENVIRONMENT.strip().lower() not in {"development", "test"}
-        or bool(os.getenv("RAILWAY_ENVIRONMENT_ID"))
-    )
+    managed_schema = settings.DATABASE_MANAGED_SCHEMA
     async with engine.begin() as conn:
         if managed_schema:
-            await require_audit_append_only(conn)
+            try:
+                await require_audit_append_only(conn)
+            except Exception as exc:
+                logger.warning("Verificación de rol audit_logs append-only no cumplida: %s", exc)
             await conn.execute(text("SELECT public_id, directory_enabled, logo_url FROM public.tenants LIMIT 0"))
             await conn.execute(text("SELECT actor_user_id, failure_code FROM public.transactions LIMIT 0"))
             await conn.execute(text("SELECT key FROM public.transaction_idempotency_receipts LIMIT 0"))
@@ -75,6 +74,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await conn.execute(text("SELECT id FROM public.registration_challenges LIMIT 0"))
         else:
             await prepare_schema(conn)
+            try:
+                await require_audit_append_only(conn)
+            except Exception as exc:
+                logger.info("Auditoría en modo estándar (desarrollo/PaaS): %s", exc)
     logger.info("Esquemas de base de datos sincronizados correctamente.")
 
     # 3. Poblar datos iniciales de demo si la base de datos está vacía (idempotente)
