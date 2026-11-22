@@ -39,9 +39,13 @@ async def provision(role: str, password: str | None = None) -> None:
         """))
         await connection.execute(text(f"""
             GRANT SELECT, INSERT, UPDATE ON public.tenants, public.accounts,
-                public.transaction_idempotency_receipts, public.registration_challenges, public.transfer_quotes TO {identifier}
+                public.transaction_idempotency_receipts, public.registration_challenges, public.transfer_quotes,
+                public.user_profiles, public.profile_email_changes TO {identifier}
         """))
-        await connection.execute(text(f"GRANT UPDATE (email_verified_at) ON public.users TO {identifier}"))
+        await connection.execute(text(f"GRANT DELETE ON public.profile_email_changes TO {identifier}"))
+        await connection.execute(text(f"""
+            GRANT UPDATE (full_name, email, email_verified_at, updated_at) ON public.users TO {identifier}
+        """))
         await require_audit_append_only(connection, role)
 
 

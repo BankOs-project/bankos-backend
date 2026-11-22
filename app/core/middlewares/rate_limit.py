@@ -43,6 +43,7 @@ TRANSACTION_USER = RateLimitRule(60)
 INTERBANK_QUOTE_USER = RateLimitRule(8)
 REGISTRATION_IP = RateLimitRule(15)
 REGISTRATION_MAIL = RateLimitRule(3, 900)
+PROFILE_EMAIL_VERIFY = RateLimitRule(10, 900)
 
 
 async def _enforce(key: str, rule: RateLimitRule, *, unavailable_code: str | None = None) -> None:
@@ -89,6 +90,23 @@ async def enforce_registration_mail_limit(
     await _enforce(f"rl:register:mail:{tenant_id}:{digest}", REGISTRATION_MAIL, unavailable_code="REGISTRATION_UNAVAILABLE")
     if source_user_id is not None:
         await _enforce(f"rl:register:source:{source_user_id}", REGISTRATION_MAIL, unavailable_code="REGISTRATION_UNAVAILABLE")
+
+
+async def enforce_profile_email_limit(tenant_id: UUID, user_id: UUID, *, email: str | None = None) -> None:
+    if email is None:
+        await _enforce(
+            f"rl:profile:verify:{tenant_id}:{user_id}", PROFILE_EMAIL_VERIFY,
+            unavailable_code="PROFILE_EMAIL_UNAVAILABLE",
+        )
+        return
+    await _enforce(
+        f"rl:profile:send:{tenant_id}:{user_id}", REGISTRATION_MAIL,
+        unavailable_code="PROFILE_EMAIL_UNAVAILABLE",
+    )
+    digest = sha256(email.encode()).hexdigest()
+    await _enforce(
+        f"rl:profile:mail:{tenant_id}:{digest}", REGISTRATION_MAIL, unavailable_code="PROFILE_EMAIL_UNAVAILABLE",
+    )
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):

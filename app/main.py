@@ -75,6 +75,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await conn.execute(text("SELECT key FROM public.transaction_idempotency_receipts LIMIT 0"))
             await conn.execute(text("SELECT person_id, email_verified_at FROM public.users LIMIT 0"))
             await conn.execute(text("SELECT id FROM public.registration_challenges LIMIT 0"))
+            await conn.execute(text("SELECT user_id FROM public.user_profiles LIMIT 0"))
+            await conn.execute(text("SELECT user_id FROM public.profile_email_changes LIMIT 0"))
             await conn.execute(text("""
                 SELECT reactivated_at, can_deactivate_at, requires_admin_reactivation
                 FROM public.accounts LIMIT 0
