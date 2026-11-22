@@ -1,6 +1,7 @@
 from datetime import datetime
+from typing import Annotated, Literal
 import uuid
-from pydantic import BaseModel, EmailStr, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, SecretStr, StringConstraints, field_validator
 
 from app.modules.auth_users.domain.entities import UserRole
 
@@ -63,4 +64,54 @@ class UserResponseDTO(BaseModel):
     role: UserRole
     is_active: bool
     created_at: datetime
+
+
+class UpdateProfileDTO(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    full_name: Annotated[str, StringConstraints(min_length=3, max_length=150)] | None = None
+    document_type: Literal["CC", "CE"] | None = None
+    document_number: Annotated[str, StringConstraints(pattern=r"^[0-9]{3,12}$")] | None = None
+    phone: Annotated[str, StringConstraints(pattern=r"^\+[1-9][0-9]{7,14}$")] | None = None
+    address: Annotated[str, StringConstraints(max_length=250)] | None = None
+
+    @field_validator("document_type", "document_number", "phone", "address", mode="before")
+    @classmethod
+    def normalize_optional(cls, value):
+        return value.strip() or None if isinstance(value, str) else value
+
+    @field_validator("full_name", mode="before")
+    @classmethod
+    def normalize_name(cls, value):
+        if value is None:
+            raise ValueError("El nombre completo es obligatorio")
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("full_name", "address")
+    @classmethod
+    def reject_control_characters(cls, value):
+        if value and not value.isprintable():
+            raise ValueError("Usa caracteres imprimibles")
+        return value
+
+
+class StartProfileEmailChangeDTO(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    new_email: EmailStr = Field(max_length=255)
+    current_password: SecretStr = Field(min_length=1, max_length=1024)
+
+
+class VerifyProfileEmailChangeDTO(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: uuid.UUID
+    email_code: SecretStr = Field(min_length=1, max_length=128)
+
+    @field_validator("email_code")
+    @classmethod
+    def validate_code(cls, value: SecretStr):
+        if not value.get_secret_value().isascii():
+            raise ValueError("El código contiene caracteres no válidos")
+        return value
 

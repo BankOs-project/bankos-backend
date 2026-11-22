@@ -2,7 +2,6 @@ from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.exceptions import AuthenticationFailedException
 from app.core.middlewares.rate_limit import enforce_login_account_limit
 from app.core.responses import success_response
 from app.modules.audit.infrastructure.repositories import PostgresAuditRepository
@@ -20,13 +19,14 @@ from app.modules.auth_users.application.use_cases import (
 from app.modules.auth_users.infrastructure.repositories import PostgresUserRepository
 from app.modules.auth_users.presentation.dependencies import (
     AuthenticatedUser,
-    get_current_user,
     get_optional_registration_actor,
     require_admin_role,
 )
+from app.modules.auth_users.presentation.profile_router import router as profile_router
 from app.modules.tenants.infrastructure.repositories import PostgresTenantRepository
 
 router = APIRouter(prefix="/auth", tags=["Autenticación y Usuarios"])
+router.include_router(profile_router)
 
 
 @router.post("/register", status_code=status.HTTP_202_ACCEPTED)
@@ -56,7 +56,6 @@ async def verify_registration(
         internal_code="REGISTRATION_VERIFIED",
         status_code=status.HTTP_201_CREATED,
     )
-
 
 @router.post(
     "/login",
@@ -107,33 +106,3 @@ async def create_user(
         internal_code="USER_CREATED",
         status_code=status.HTTP_201_CREATED,
     )
-
-
-@router.get(
-    "/me",
-    summary="Obtener perfil del usuario actualmente autenticado",
-)
-async def get_my_profile(
-    current_user: AuthenticatedUser = Depends(get_current_user),
-    session: AsyncSession = Depends(get_db),
-):
-    """Retorna los datos de sesión y tenant del usuario en curso."""
-    user_repo = PostgresUserRepository(session)
-    user = await user_repo.get_by_id(current_user.user_id)
-    if not user or user.tenant_id != current_user.tenant_id or not user.is_active:
-        raise AuthenticationFailedException("La sesión no corresponde a un usuario activo")
-
-    return success_response(
-        data={
-            "id": str(user.id),
-            "tenant_id": str(user.tenant_id),
-            "email": user.email,
-            "full_name": user.full_name,
-            "role": user.role.value,
-            "is_active": user.is_active,
-            "created_at": user.created_at.isoformat(),
-        },
-        message="Perfil obtenido exitosamente",
-        internal_code="USER_PROFILE",
-    )
-

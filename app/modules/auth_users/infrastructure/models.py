@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 import uuid
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, LargeBinary, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -90,4 +90,29 @@ class RegistrationChallengeModel(Base):
     source_digest: Mapped[str | None] = mapped_column(String(64))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class UserProfileModel(Base):
+    """Datos declarados y privados de una relación bancaria."""
+
+    __tablename__ = "user_profiles"
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"))
+    document_type: Mapped[str | None] = mapped_column(String(2))
+    document_number: Mapped[str | None] = mapped_column(String(12))
+    phone: Mapped[str | None] = mapped_column(String(16))
+    address: Mapped[str | None] = mapped_column(String(250))
+    photo_type: Mapped[str | None] = mapped_column(String(10))
+    photo_content: Mapped[bytes | None] = mapped_column(LargeBinary, deferred_raiseload=True)
+
+
+class ProfileEmailChangeModel(Base):
+    __tablename__ = "profile_email_changes"
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"))
+    request_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True))
+    previous_email: Mapped[str] = mapped_column(String(255))
+    new_email: Mapped[str] = mapped_column(String(255))
+    code_digest: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 

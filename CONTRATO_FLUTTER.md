@@ -75,7 +75,11 @@ HTTP 200 · `LOGIN_SUCCESS` · `data`
 }
 ```
 
-`GET /auth/me` con Bearer · HTTP 200 · `USER_PROFILE` · `data`
+## Perfil propio
+
+Todas las rutas de esta sección usan `Authorization: Bearer <access_token>`. El servidor identifica al titular y al banco a partir de la sesión. Los perfiles de una misma persona en bancos distintos se editan por separado.
+
+`GET /auth/me` · HTTP 200 · `USER_PROFILE` · `data`
 
 ```json
 {
@@ -85,11 +89,96 @@ HTTP 200 · `LOGIN_SUCCESS` · `data`
   "full_name": "Juan Pérez Gómez",
   "role": "cliente",
   "is_active": true,
-  "created_at": "2026-11-19T15:00:00+00:00"
+  "created_at": "2026-11-19T15:00:00+00:00",
+  "email_verified_at": null,
+  "document_type": null,
+  "document_number": null,
+  "phone": null,
+  "address": null,
+  "photo_url": null
 }
 ```
 
-Flutter guarda el token y el banco de la sesión. Usa `full_name` para el saludo. El backend extrae el tenant de las peticiones autenticadas desde el JWT.
+Flutter puede seguir restaurando la sesión con los mismos campos, token y banco. `email_verified_at` es una fecha ISO 8601 con zona horaria o `null` si el correo aún no se ha verificado, como en algunos usuarios existentes. Trata el documento, la dirección y la foto como datos privados y evita escribirlos en los logs, incluso en los interceptores de Dio.
+
+`PATCH /auth/me` recibe JSON y devuelve HTTP 200, `USER_PROFILE_UPDATED` y el mismo `data` que `GET /auth/me`, con los cambios aplicados. Omite los campos que quieras conservar. Para limpiar un campo opcional envía `null`. También se acepta una cadena vacía o de solo espacios para limpiar un campo opcional.
+
+```json
+{
+  "full_name": "Juan Pérez Gómez",
+  "document_type": "CC",
+  "document_number": "0012345678",
+  "phone": "+573001234567",
+  "address": "Calle 10 # 20-30"
+}
+```
+
+| Campo | Formato |
+| --- | --- |
+| `full_name` | Entre 3 y 150 caracteres imprimibles después de quitar espacios exteriores. Si se envía, es obligatorio. |
+| `document_type` | `CC` para cédula de ciudadanía o `CE` para cédula de extranjería. |
+| `document_number` | Texto de 3 a 12 dígitos ASCII. Conserva ceros iniciales. |
+| `phone` | Formato internacional con `+` y de 8 a 15 dígitos. El primero debe ser distinto de cero. |
+| `address` | Hasta 250 caracteres imprimibles después de quitar espacios exteriores. |
+
+El tipo y el número deben quedar ambos presentes o ambos vacíos. El documento es un dato declarado. Editarlo conserva el UUID de persona, las vinculaciones y las cuentas. La acreditación de titularidad del documento queda pendiente de un proceso de verificación independiente. El `PATCH` rechaza campos ajenos a la tabla, incluido `email`.
+
+### Foto privada
+
+| Solicitud | Resultado |
+| --- | --- |
+| `PUT /auth/me/photo` con `Content-Type: image/jpeg` o `image/png` y los bytes como cuerpo | HTTP 200 · `PROFILE_PHOTO_UPDATED` · perfil completo. Sustituye la foto anterior. |
+| `GET /auth/me/photo` | HTTP 200 · bytes con el `Content-Type` de la imagen. Si falta, HTTP 404 · `PROFILE_PHOTO_NOT_FOUND`. |
+| `DELETE /auth/me/photo` | HTTP 200 · `PROFILE_PHOTO_REMOVED` · perfil con `photo_url: null`. Puede repetirse. |
+
+Envía una imagen estática de hasta 2048 × 2048 píxeles y 2 MiB. Envía los bytes directamente, sin `multipart/form-data` ni base64. El servidor valida el formato real y guarda una imagen reconstruida a partir de sus píxeles, sin metadatos como EXIF o GPS. El límite de 2 MiB también se aplica a la imagen guardada. `photo_url` es la ruta privada `/api/v1/auth/me/photo` relativa al origen. Con Dio configurado con la base `/api/v1`, solicita `/auth/me/photo` con Bearer y `ResponseType.bytes`. Actualiza los bytes después de subir o quitar la foto. Las respuestas privadas de éxito incluyen `Cache-Control: private, no-store`.
+
+### Cambiar el correo de acceso
+
+1. Envía `POST /auth/me/email-change` con el correo nuevo y la contraseña actual de ese banco.
+
+   ```json
+   {"new_email":"juan.nuevo@example.com","current_password":"<contraseña actual>"}
+   ```
+
+   HTTP 202 · `PROFILE_EMAIL_PENDING` · `data`
+
+   ```json
+   {"request_id":"b2232afd-4d66-4416-8ebb-7a624415e92a","expires_in":1200}
+   ```
+
+2. Envía `POST /auth/me/email-change/verify` con el identificador de la solicitud y el código de un solo uso recibido en el correo nuevo. Usa el Bearer de la misma relación bancaria.
+
+   ```json
+   {"request_id":"b2232afd-4d66-4416-8ebb-7a624415e92a","email_code":"<código recibido>"}
+   ```
+
+   HTTP 200 · `PROFILE_EMAIL_UPDATED` · perfil completo con `email` y `email_verified_at` actualizados. Actualiza el correo en la sesión local. El JWT conserva su vigencia habitual. El correo anterior funciona para iniciar sesión hasta la confirmación. El nuevo correo se guarda en minúsculas, tiene un máximo de 255 caracteres y debe estar libre en el mismo banco.
+
+La última solicitud aceptada reemplaza a la anterior. Si vence el código, inicia una solicitud nueva. El backend admite hasta tres solicitudes por usuario y por correo destino dentro del banco cada 15 minutos y hasta diez intentos de verificación por usuario en el mismo período. Usa `Retry-After` cuando recibas HTTP 429. Evita registrar la contraseña o el código.
+
+| HTTP | `internal_code` | Manejo en Flutter |
+| --- | --- | --- |
+| 401 | `UNAUTHORIZED` / `AUTHENTICATION_FAILED` | Revisa la sesión. En la solicitud de correo, pide comprobar la contraseña si la sesión sigue vigente. |
+| 400 | `PROFILE_EMAIL_INVALID` | El código o la solicitud no corresponden, vencieron o ya se usaron. |
+| 409 | `PROFILE_EMAIL_UNCHANGED` / `PROFILE_EMAIL_UNAVAILABLE_IN_BANK` | Solicita otro correo para ese banco. |
+| 413 | `PROFILE_PHOTO_TOO_LARGE` | Reduce el tamaño del archivo. |
+| 415 | `PROFILE_PHOTO_UNSUPPORTED_TYPE` | Selecciona una foto JPEG o PNG. |
+| 422 | `PROFILE_PHOTO_INVALID` / `PROFILE_DOCUMENT_INCOMPLETE` / `VALIDATION_ERROR` | Revisa la foto, el par de campos de documento o los campos indicados. |
+| 429 | `RATE_LIMIT_EXCEEDED` | Espera lo indicado en `Retry-After`. |
+| 503 | `PROFILE_EMAIL_UNAVAILABLE` | Conserva el correo mostrado y permite intentarlo más tarde. |
+
+### Migración en Railway
+
+El cambio agrega `user_profiles` y `profile_email_changes`. Los usuarios existentes pueden entrar sin fila de perfil. Sus identificadores, correos, contraseñas, vínculos y cuentas se conservan.
+
+Si Railway usa `DATABASE_MANAGED_SCHEMA=true`, ejecuta antes del despliegue el comando de la nueva versión con `DATABASE_URL` del **dueño del esquema**. Sustituye `bankos_app` si la API usa otro rol. El comando crea las tablas y actualiza los permisos del rol de ejecución. Mantén en la API la URL de ese rol.
+
+```sh
+uv run --locked python -m scripts.provision_database bankos_app
+```
+
+En una imagen que ya tiene las dependencias instaladas, el comando equivalente es `python -m scripts.provision_database bankos_app`. Con `DATABASE_MANAGED_SCHEMA=false`, el arranque aplica la preparación de esquema con el rol que tiene DDL. Para el envío, configura `RESEND_API_KEY` y `REGISTRATION_EMAIL_FROM` con un remitente verificado en Resend, igual que para el registro. El cambio de correo también requiere el Redis configurado para limitar intentos.
 
 ## Qué significa el ID personal
 

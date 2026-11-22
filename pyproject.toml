@@ -16,6 +16,7 @@ dependencies = [
     "pyjwt[crypto]>=2.9.0",
     "pwdlib[argon2,bcrypt]>=0.2.1",
     "python-multipart>=0.0.9",
+    "pillow>=12.3,<13",
 ]
 
 [build-system]

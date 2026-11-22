@@ -1,4 +1,4 @@
-"""Entrega las pruebas de registro por el canal de correo configurado."""
+"""Entrega verificaciones por el canal de correo configurado."""
 
 import logging
 
@@ -11,11 +11,19 @@ logger = logging.getLogger("bankos.registration")
 
 
 async def send_registration_code(email: str, code: str, *, source: bool = False) -> None:
+    purpose = "autorizar una vinculación desde tu banco actual" if source else "verificar tu correo de registro"
+    await _send_code(email, code, purpose, "REGISTRATION_UNAVAILABLE")
+
+
+async def send_profile_email_code(email: str, code: str) -> None:
+    await _send_code(email, code, "confirmar este nuevo correo de acceso", "PROFILE_EMAIL_UNAVAILABLE")
+
+
+async def _send_code(email: str, code: str, purpose: str, unavailable_code: str) -> None:
     api_key = settings.RESEND_API_KEY.get_secret_value() if settings.RESEND_API_KEY else None
     if not api_key or not settings.REGISTRATION_EMAIL_FROM:
-        raise BankOSException("El envío de correo no está disponible", "REGISTRATION_UNAVAILABLE", 503)
+        raise BankOSException("El envío de correo no está disponible", unavailable_code, 503)
 
-    purpose = "autorizar una vinculación desde tu banco actual" if source else "verificar tu correo de registro"
     try:
         async with httpx.AsyncClient(timeout=8) as client:
             response = await client.post(
@@ -33,5 +41,5 @@ async def send_registration_code(email: str, code: str, *, source: bool = False)
             )
             response.raise_for_status()
     except httpx.HTTPError:
-        logger.warning("Falló la entrega de una verificación de registro")
-        raise BankOSException("El envío de correo no está disponible", "REGISTRATION_UNAVAILABLE", 503) from None
+        logger.warning("Falló la entrega de una verificación de correo")
+        raise BankOSException("El envío de correo no está disponible", unavailable_code, 503) from None
