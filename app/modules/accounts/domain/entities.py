@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 import uuid
@@ -28,6 +28,9 @@ class Account:
     status: AccountStatus = AccountStatus.ACTIVE
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    reactivated_at: datetime | None = None
+    can_deactivate_at: datetime | None = None
+    requires_admin_reactivation: bool = False
 
     @classmethod
     def create(
@@ -68,6 +71,9 @@ class Account:
                 internal_code="ACCOUNT_INACTIVE",
                 status_code=400,
             )
+        self._ensure_not_blocked()
+
+    def _ensure_not_blocked(self) -> None:
         if self.status == AccountStatus.BLOCKED:
             raise BankOSException(
                 message=f"La cuenta {self.account_number} se encuentra bloqueada por seguridad o auditoría.",
@@ -75,20 +81,45 @@ class Account:
                 status_code=403,
             )
 
-    def deactivate(self) -> None:
+    def deactivate(self, *, now: datetime, administrative: bool) -> bool:
         """Aplica borrado lógico cambiando el estado a INACTIVE."""
+        self._ensure_not_blocked()
+        if self.status == AccountStatus.INACTIVE:
+            return False
+        if not administrative and self.can_deactivate_at is not None and now < self.can_deactivate_at:
+            raise BankOSException(
+                message="La cuenta todavía está en el plazo de espera después de su reactivación",
+                internal_code="ACCOUNT_DEACTIVATION_COOLDOWN",
+                status_code=409,
+                data={"can_deactivate_at": self.can_deactivate_at.isoformat()},
+            )
         self.status = AccountStatus.INACTIVE
-        self.updated_at = datetime.now(timezone.utc)
+        self.requires_admin_reactivation = administrative
+        self.updated_at = now
+        return True
 
     def block(self) -> None:
         """Bloquea preventivamente la cuenta bancaria."""
         self.status = AccountStatus.BLOCKED
         self.updated_at = datetime.now(timezone.utc)
 
-    def activate(self) -> None:
+    def activate(self, *, now: datetime, cooldown: timedelta, administrative: bool) -> bool:
         """Reactiva una cuenta bancaria."""
+        self._ensure_not_blocked()
+        if self.status == AccountStatus.ACTIVE:
+            return False
+        if self.requires_admin_reactivation and not administrative:
+            raise BankOSException(
+                message="La reactivación de esta cuenta requiere un administrador del banco",
+                internal_code="ACCOUNT_REACTIVATION_REQUIRES_ADMIN",
+                status_code=403,
+            )
         self.status = AccountStatus.ACTIVE
-        self.updated_at = datetime.now(timezone.utc)
+        self.reactivated_at = now
+        self.can_deactivate_at = now + cooldown
+        self.requires_admin_reactivation = False
+        self.updated_at = now
+        return True
 
     def credit(self, amount: Decimal) -> None:
         """Abona fondos a la cuenta validando integridad."""

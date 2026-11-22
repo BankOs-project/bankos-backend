@@ -14,6 +14,7 @@ from decimal import Decimal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Query, Response, status
 from fastapi.responses import JSONResponse
+from pydantic import AwareDatetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -24,7 +25,7 @@ from app.core.middlewares.idempotency import (
     get_idempotency_context,
 )
 from app.core.middlewares.rate_limit import enforce_transaction_user_limit
-from app.core.responses import success_response
+from app.core.responses import APIResponse, success_response
 from app.modules.accounts.infrastructure.repositories import PostgresAccountRepository
 from app.modules.auth_users.presentation.dependencies import (
     AuthenticatedUser,
@@ -32,14 +33,18 @@ from app.modules.auth_users.presentation.dependencies import (
 )
 from app.modules.tenants.infrastructure.repositories import PostgresTenantRepository
 from app.modules.transactions.application.dtos import (
+    ConfirmTransferDTO,
     DepositDTO,
+    FinancialSummaryDTO,
     QuoteRequestDTO,
     TransactionResponseDTO,
     TransferDTO,
     WithdrawDTO,
 )
+from app.modules.transactions.application.quoted_transfers import QuotedTransferService
 from app.modules.transactions.application.use_cases import (
     DepositUseCase,
+    GetFinancialSummaryUseCase,
     GetTransactionHistoryUseCase,
     InternalTransferUseCase,
     QuoteTransactionUseCase,
@@ -48,6 +53,7 @@ from app.modules.transactions.application.use_cases import (
     transaction_to_dto,
 )
 from app.modules.transactions.domain.entities import OperationType
+from app.modules.transactions.infrastructure.models import TransferQuoteModel
 from app.modules.transactions.infrastructure.repositories import (
     PostgresTransactionRepository,
 )
@@ -73,8 +79,11 @@ _SUCCESS_DETAILS = {
 
 def _operation_response(result: TransactionResponseDTO) -> JSONResponse:
     code, message = _SUCCESS_DETAILS[result.operation_type]
+    excluded = {"failure_code"}
+    if result.transfer_mode is None:
+        excluded.update(("transfer_mode", "transfer_reference"))
     return success_response(
-        data=result.model_dump(mode="json", exclude={"failure_code"}),
+        data=result.model_dump(mode="json", exclude=excluded),
         message=message,
         internal_code=code,
         status_code=status.HTTP_201_CREATED,
@@ -113,6 +122,7 @@ async def _record_rejection(
     *,
     source_account_number: str | None = None,
     destination_account_number: str | None = None,
+    quote: TransferQuoteModel | None = None,
 ):
     try:
         async with idemp.session.begin_nested():
@@ -120,6 +130,10 @@ async def _record_rejection(
     except BankOSException as exc:
         # El savepoint ya revirtió los cambios del movimiento. El intento
         # rechazado se confirma sin crear un comprobante de éxito.
+        if quote is not None and exc.internal_code in {
+            "QUOTE_STALE", "DESTINATION_UNAVAILABLE", "ACCOUNT_INACTIVE", "ACCOUNT_BLOCKED", "AUTHORIZATION_FAILED",
+        }:
+            quote.invalidated_at = datetime.now(timezone.utc)
         await record_rejected_transaction(
             PostgresAccountRepository(idemp.session),
             PostgresTransactionRepository(idemp.session),
@@ -156,12 +170,15 @@ async def quote_transaction(
     account_repo = PostgresAccountRepository(session)
     use_case = QuoteTransactionUseCase(tenant_repo, account_repo)
 
-    result = await use_case.execute(
-        tenant_id=current_user.tenant_id,
-        dto=dto,
-        actor_user_id=current_user.user_id,
-        actor_role=current_user.role,
-    )
+    if dto.operation_type == OperationType.TRANSFER:
+        result = await QuotedTransferService(session).quote(dto, current_user)
+    else:
+        result = await use_case.execute(
+            tenant_id=current_user.tenant_id,
+            dto=dto,
+            actor_user_id=current_user.user_id,
+            actor_role=current_user.role,
+        )
     return success_response(
         data=result.model_dump(mode="json"),
         message="Cotización calculada exitosamente",
@@ -257,29 +274,33 @@ async def withdraw(
 
 @router.post(
     "/transfer",
-    summary="Transferencia interna multimoneda entre cuentas del mismo tenant",
+    summary="Confirmar transferencia interna o simulada entre bancos",
     status_code=status.HTTP_201_CREATED,
 )
 async def transfer(
-    dto: TransferDTO,
+    dto: ConfirmTransferDTO | TransferDTO,
     background_tasks: BackgroundTasks,
     current_user: AuthenticatedUser = Depends(get_current_user),
     idemp: IdempotencyContext = Depends(get_idempotency_context),
 ):
-    """Mueve fondos entre dos cuentas de la institución con:
-    - Comisión configurada (FIXED o PERCENTAGE)
-    - Conversión de divisas con tasas estáticas del tenant
-    - Bloqueo pesimista anti-deadlock (orden alfabético por account_number)
-    - Idempotencia por clave UUID con caché en Redis (TTL 24h)
-    - Webhook asíncrono si el tenant tiene configurado `webhook_url`
-
-    Requiere el header **Idempotency-Key** (UUID v4 generado en el cliente).
-    """
+    """Confirma una cotización. El formato anterior sigue habilitado dentro del mismo banco."""
     replay = await _replay_operation(idemp, dto.idempotency_key, OperationType.TRANSFER)
     if replay is not None:
         return replay
 
     session = idemp.session
+    if isinstance(dto, ConfirmTransferDTO):
+        service = QuotedTransferService(session)
+        quote = await service.get_locked_quote(dto.quote_id, current_user)
+        async with _record_rejection(
+            idemp, OperationType.TRANSFER, Decimal(quote.snapshot["original_amount"]),
+            source_account_number=quote.source_number,
+            destination_account_number=quote.destination_number if quote.destination_public_id is None else None,
+            quote=quote,
+        ):
+            result = await service.execute(quote, current_user, idemp.idempotency_key)
+        return await idemp.confirm(_operation_response(result))
+
     tenant_repo = PostgresTenantRepository(session)
     account_repo = PostgresAccountRepository(session)
     tx_repo = PostgresTransactionRepository(session)
@@ -314,7 +335,7 @@ async def transfer(
             webhook_dispatcher.dispatch,
             webhook_url=tenant.webhook_url,
             event_type="transfer.completed",
-            payload=result.model_dump(mode="json", exclude={"failure_code"}),
+            payload=result.model_dump(mode="json", exclude={"failure_code", "transfer_mode", "transfer_reference"}),
             correlation_id=result.correlation_id,
         )
 
@@ -364,4 +385,34 @@ async def get_transaction_history(
         data=result.model_dump(mode="json"),
         message="Historial de transacciones obtenido exitosamente",
         internal_code="TRANSACTIONS_FETCHED",
+    )
+
+
+@router.get(
+    "/summary",
+    summary="Resumen financiero de las cuentas propias",
+    response_model=APIResponse[FinancialSummaryDTO],
+)
+async def get_financial_summary(
+    start_date: AwareDatetime = Query(description="Inicio inclusivo del período, con zona horaria"),
+    end_date: AwareDatetime = Query(description="Fin inclusivo del período, con zona horaria"),
+    account_number: str | None = Query(None, min_length=1, max_length=20),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+):
+    use_case = GetFinancialSummaryUseCase(
+        PostgresTransactionRepository(session),
+        PostgresAccountRepository(session),
+    )
+    result = await use_case.execute(
+        tenant_id=current_user.tenant_id,
+        actor_user_id=current_user.user_id,
+        start_date=start_date,
+        end_date=end_date,
+        account_number=account_number,
+    )
+    return success_response(
+        data=result.model_dump(mode="json"),
+        message="Resumen financiero obtenido",
+        internal_code="FINANCIAL_SUMMARY_FETCHED",
     )

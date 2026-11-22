@@ -34,6 +34,9 @@ class AccountResponseDTO(BaseModel):
     status: AccountStatus
     created_at: datetime
     updated_at: datetime
+    reactivated_at: datetime | None = None
+    can_deactivate_at: datetime | None = None
+    requires_admin_reactivation: bool = False
 
 
 class PaginatedAccountsResponseDTO(BaseModel):

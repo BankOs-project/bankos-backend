@@ -159,7 +159,55 @@ El registro comprueba el correo dentro del banco elegido. La API no informa si e
 }
 ```
 
-`GET /accounts/1000000002` devuelve una sola cuenta con esos campos bajo `data` y código `ACCOUNT_DETAIL_FETCHED`. Muestra saldo, moneda y estado. Habilita operaciones en cuentas `ACTIVE`. Los otros estados son `INACTIVE` y `BLOCKED`.
+`GET /accounts/1000000002` devuelve una sola cuenta bajo `data` con código `ACCOUNT_DETAIL_FETCHED`. Además del saldo, la moneda y el estado, el detalle y las respuestas de cambio de estado incluyen los campos de reactivación. El listado también los devuelve.
+
+```json
+{
+  "account_number": "1000000002",
+  "balance": "1500.0000",
+  "currency": "USD",
+  "status": "ACTIVE",
+  "reactivated_at": "2026-11-20T14:00:00Z",
+  "can_deactivate_at": "2026-11-21T14:00:00Z",
+  "requires_admin_reactivation": false
+}
+```
+
+El ejemplo abrevia `data`. `reactivated_at` registra la última reactivación y `can_deactivate_at` indica cuándo puede volver a desactivar el titular. Ambas fechas son instantes UTC y pueden ser `null` si nunca hubo una reactivación registrada. El vencimiento se fija al reactivar con la configuración del servidor, `ACCOUNT_DEACTIVATION_COOLDOWN_HOURS`, cuyo valor inicial es **24 horas**. Un cambio de configuración aplica a reactivaciones futuras. El titular puede desactivar en el instante exacto de vencimiento.
+
+### Cambiar el estado de una cuenta
+
+Ambas solicitudes usan Bearer y el número de cuenta en la URL. Envía la petición sin cuerpo.
+
+| Solicitud | Éxito | Estado resultante |
+| --- | --- | --- |
+| `PATCH /accounts/{account_number}/deactivate` | 200 · `ACCOUNT_DEACTIVATED` | `INACTIVE` |
+| `PATCH /accounts/{account_number}/reactivate` | 200 · `ACCOUNT_REACTIVATED` | `ACTIVE` |
+
+Flutter permite operar en cuentas `ACTIVE`. Para `INACTIVE`, muestra la opción de reactivar si `requires_admin_reactivation` es `false`. Para `BLOCKED`, muestra el bloqueo administrativo y deshabilita ambos cambios de estado. Una desactivación administrativa conserva `INACTIVE` y exige que el banco la revierta. El administrador puede desactivar dentro de su banco incluso durante el plazo del titular. Repetir una solicitud que ya llegó al estado pedido devuelve el mismo estado y conserva el vencimiento anterior.
+
+| HTTP y código | Qué muestra Flutter |
+| --- | --- |
+| 401 · `UNAUTHORIZED` | Pedir inicio de sesión. |
+| 403 · `AUTHORIZATION_FAILED` | Indicar que esa cuenta no pertenece al usuario. |
+| 403 · `ACCOUNT_REACTIVATION_REQUIRES_ADMIN` | Indicar que el banco debe reactivar la cuenta. |
+| 403 · `ACCOUNT_BLOCKED` | Mostrar el bloqueo e indicar que el banco debe atenderlo. |
+| 404 · `RESOURCE_NOT_FOUND` | Mostrar que la cuenta no está disponible en el banco de la sesión. |
+| 409 · `ACCOUNT_DEACTIVATION_COOLDOWN` | Mostrar `data.can_deactivate_at` en la zona del usuario. El servidor decide cuándo venció el plazo. |
+| 400 · `ACCOUNT_INACTIVE` | Al intentar una operación financiera, mostrar el estado inactivo y ofrecer la reactivación si corresponde. |
+
+Ejemplo abreviado del error de plazo
+
+```json
+{
+  "success": false,
+  "internal_code": "ACCOUNT_DEACTIVATION_COOLDOWN",
+  "message": "La cuenta todavía está en el plazo de espera después de su reactivación",
+  "data": {"can_deactivate_at": "2026-11-21T14:00:00+00:00"}
+}
+```
+
+Los cambios guardan el estado y la auditoría en la misma transacción. Conservan el saldo y el historial. Al aprovisionar una base existente, el historial de auditoría disponible identifica las cuentas inactivadas por un administrador. Las cuentas inactivas históricas sin evidencia administrativa quedan disponibles para reactivación por el titular.
 
 `GET /accounts/1000000003/destination` con Bearer · HTTP 200 · `TRANSFER_DESTINATION_FOUND`
 
@@ -199,14 +247,109 @@ Usa esta consulta cuando el usuario termine de escribir el número e indique que
   "source_currency": "USD",
   "destination_currency": "COP",
   "original_amount": "10.00",
-  "fee_calculated": "0.1500",
-  "amount_to_debit": "10.1500",
+  "fee_calculated": "0.0000",
+  "amount_to_debit": "10.0000",
   "exchange_rate_applied": "4200.000000",
-  "final_amount_to_receive": "42000.0000"
+  "final_amount_to_receive": "42000.0000",
+  "quote_id": "ffe871b8-9d29-47d0-9ea9-198dfa83bfe7",
+  "expires_at": "2026-11-20T15:17:00Z",
+  "transfer_mode": "SAME_BANK",
+  "recipient": null
 }
 ```
 
-Muestra el desglose tal como lo devuelve el backend. En este ejemplo, la cuenta origen se debita por 10,15 USD y la cuenta destino recibe 42.000 COP. Para cotizar `DEPOSIT` o `WITHDRAWAL`, envía `operation_type`, `source_account_number` con la cuenta propia y `amount`. La cotización del depósito tiene débito cero y calcula el abono. La del retiro muestra el cargo y el monto a retirar. La cotización no reserva fondos. La confirmación vuelve a aplicar las reglas vigentes.
+Muestra el desglose tal como lo devuelve el backend. En «Mismo banco» la cuenta origen se debita por 10 USD y la cuenta destino recibe 42.000 COP. La comisión es cero. Para cotizar `DEPOSIT` o `WITHDRAWAL`, envía `operation_type`, `source_account_number` con la cuenta propia y `amount`. La cotización del depósito tiene débito cero y calcula el abono. La del retiro muestra el cargo y el monto a retirar. La cotización no reserva fondos.
+
+### Transferencia simulada entre bancos
+
+Flutter toma el identificador público del banco de `GET /banks` y envía el número como texto. El destinatario puede recibir sin iniciar un trámite. El servidor consulta el número únicamente dentro del banco indicado. El entorno debe tener `SIMULATED_INTERBANK_ENABLED=true` y el esquema aprovisionado.
+
+```http
+POST /api/v1/transactions/quote
+Authorization: Bearer <token>
+Content-Type: application/json
+```
+
+```json
+{
+  "operation_type": "TRANSFER",
+  "transfer_mode": "OTHER_BANK",
+  "source_account_number": "3200000002",
+  "destination_bank_id": "0d54d975-88a4-49ed-9e0e-af19ed20af70",
+  "destination_account_number": "3300000003",
+  "amount": "10.00"
+}
+```
+
+HTTP 200 · `QUOTE_CALCULATED` · `data`. Usa el identificador real del directorio para seleccionar el banco.
+
+```json
+{
+  "operation_type": "TRANSFER",
+  "transfer_mode": "OTHER_BANK",
+  "quote_id": "ffe871b8-9d29-47d0-9ea9-198dfa83bfe7",
+  "expires_at": "2026-11-20T15:17:00Z",
+  "source_currency": "USD",
+  "destination_currency": "COP",
+  "original_amount": "10.00",
+  "fee_calculated": "0.1000",
+  "amount_to_debit": "10.1000",
+  "exchange_rate_applied": "4100.000000",
+  "final_amount_to_receive": "41000.0000",
+  "recipient": {
+    "bank_name": "DaviPlata",
+    "masked_holder_name": "N*** P*** D***",
+    "account_last_four": "0003"
+  }
+}
+```
+
+En «Otro banco», la comisión y la tasa salen de la configuración de origen. Muestra un aviso de simulación y solo los campos de `recipient` para identificar el destino. Para «Mismo banco», Flutter puede seguir usando la consulta local `/accounts/{number}/destination`. La cotización de «Mismo banco» admite `transfer_mode: "SAME_BANK"` u omitir ese campo.
+
+Para ambas modalidades, confirma con el `quote_id` sin volver a enviar monto ni destino. La cotización vence a los cinco minutos, queda ligada al usuario que la pidió y solo permite una confirmación exitosa. Ante un fallo de red, reenvía el mismo cuerpo con las mismas claves.
+
+```http
+POST /api/v1/transactions/transfer
+Authorization: Bearer <token>
+Content-Type: application/json
+Idempotency-Key: 34ac2258-ecef-4e61-bc96-a8870088caf2
+X-Correlation-ID: 9a17c200-0e47-4b8e-9d18-4db1bd057402
+```
+
+```json
+{"quote_id":"ffe871b8-9d29-47d0-9ea9-198dfa83bfe7"}
+```
+
+HTTP 201 · `TRANSFER_SUCCESS` · campos abreviados del comprobante del remitente
+
+```json
+{
+  "transfer_mode": "OTHER_BANK",
+  "transfer_reference": "8acc51ea-4aea-4100-9e15-397af6b496da",
+  "source_account_number": "3200000002",
+  "destination_account_number": null,
+  "original_amount": "10.0000",
+  "original_currency": "USD",
+  "converted_amount": "41000.0000",
+  "destination_currency": "COP",
+  "fee_charged": "0.1000",
+  "status": "SUCCESS"
+}
+```
+
+En el historial del receptor aparece la misma referencia, solo la cuenta destino y el abono local. En esa fila, `source_account_number` es `null`, ambos importes representan los COP acreditados y la comisión local es cero. Los identificadores de la cuenta, usuario y tenant remotos quedan fuera del comprobante. La referencia común no sirve para consultar el otro lado. Cada JWT solo permite consultar su propio tenant.
+
+| HTTP · código | Qué hace Flutter |
+| --- | --- |
+| 404 · `DESTINATION_UNAVAILABLE` | Muestra «El destino no está disponible» y vuelve al formulario. El mismo error cubre bancos o cuentas inexistentes o no habilitados para recibir. |
+| 404 · `QUOTE_UNAVAILABLE` | Solicita una nueva cotización. |
+| 409 · `QUOTE_EXPIRED`, `QUOTE_STALE` | Vuelve a cotizar y muestra el nuevo desglose para aprobación. |
+| 409 · `QUOTE_ALREADY_USED` | Consulta el historial. Si fue un reintento por desconexión, reutiliza la clave original. |
+| 403 · `INTERBANK_DISABLED` | Muestra que la modalidad simulada está deshabilitada en el entorno. |
+| 429 · `RATE_LIMIT_EXCEEDED` | Respeta `Retry-After`. La consulta entre bancos permite ocho intentos por minuto por usuario, además de los límites generales. |
+| 503 · `TRANSFER_QUOTE_UNAVAILABLE` | Muestra indisponibilidad temporal de la cotización. |
+
+El formato anterior de ejecución con cuenta de origen, número destino y monto se conserva para «Mismo banco», con comisión cero. Flutter debe usar `quote_id` para confirmar «Otro banco» y para fijar las condiciones en cualquiera de las dos modalidades.
 
 Las tres solicitudes siguientes usan Bearer y su propia `Idempotency-Key`. En Flutter, confirma el retiro o la transferencia con el PIN o la biometría local antes de enviar.
 
@@ -236,7 +379,7 @@ Respuesta de transferencia
     "converted_amount": "42000.0000",
     "destination_currency": "COP",
     "exchange_rate_applied": "4200.000000",
-    "fee_charged": "0.1500",
+    "fee_charged": "0.0000",
     "status": "SUCCESS",
     "idempotency_key": "34ac2258-ecef-4e61-bc96-a8870088caf2",
     "correlation_id": "9a17c200-0e47-4b8e-9d18-4db1bd057402",
@@ -274,6 +417,55 @@ Depósito y retiro usan el mismo esquema de transacción. Estos son los campos q
   "exchange_rate_applied": "1.000000",
   "fee_charged": "0.0000",
   "status": "SUCCESS"
+}
+```
+
+## Resumen financiero del dashboard
+
+`GET /transactions/summary` usa Bearer y requiere `start_date` y `end_date`. Omite `account_number` para consultar todas las cuentas propias. Envía el número como texto para consultar una sola cuenta propia. Una cuenta ajena o inexistente devuelve `403 AUTHORIZATION_FAILED`.
+
+Las dos fechas representan instantes ISO 8601 con zona explícita, como `Z` o `-05:00`. Ambos extremos son inclusivos y la respuesta los devuelve en UTC. El inicio y el fin pueden ser iguales para consultar un instante exacto. Un rango invertido devuelve `422 INVALID_DATE_RANGE`. Una fecha sin hora o sin zona devuelve `422 VALIDATION_ERROR`. Para un período de calendario en Bogotá, convierte el inicio y el último instante del período a UTC antes de enviarlos.
+
+- `available_balance` es el saldo disponible al momento de la consulta. Suma el saldo de las cuentas activas de la selección. Una cuenta inactiva o bloqueada aporta cero de disponibilidad, y sus movimientos confirmados anteriores siguen contando.
+- `income` suma depósitos y transferencias recibidas en la moneda y el importe acreditados. `expenses` suma retiros y transferencias enviadas en la moneda de origen, incluida la comisión.
+- Si ambos lados de una transferencia pertenecen a las cuentas seleccionadas, solo cuenta la comisión como gasto en la moneda de origen, incluso si hubo conversión. Al seleccionar una sola cuenta, cuenta el lado de esa cuenta. Para un período se consideran únicamente movimientos confirmados. Un saldo inicial sin un movimiento registrado solo contribuye a disponibilidad.
+- Los importes se devuelven como texto decimal. Flutter debe mantener cada divisa por separado. Si hay cuentas pero no hubo movimientos en el rango, los flujos son cero. Un usuario sin cuentas recibe `currencies: []`.
+
+Ejemplo para todas las cuentas, con el inicio a medianoche en Bogotá
+
+```http
+GET /transactions/summary?start_date=2026-11-01T00:00:00-05:00&end_date=2026-11-03T05:00:00Z
+```
+
+HTTP 200 · `FINANCIAL_SUMMARY_FETCHED`
+
+```json
+{
+  "success": true,
+  "internal_code": "FINANCIAL_SUMMARY_FETCHED",
+  "message": "Resumen financiero obtenido",
+  "data": {
+    "account_number": null,
+    "start_date": "2026-11-01T05:00:00Z",
+    "end_date": "2026-11-03T05:00:00Z",
+    "currencies": [
+      {"currency": "COP", "available_balance": "425000.0000", "income": "225.0000", "expenses": "121.0000"},
+      {"currency": "USD", "available_balance": "80.0000", "income": "73.0000", "expenses": "0.1500"}
+    ]
+  }
+}
+```
+
+Con las mismas fechas y `account_number=3200000001`, el abono de la transferencia propia USD a COP sí aparece como ingreso de esa cuenta. La respuesta trae este `data`.
+
+```json
+{
+  "account_number": "3200000001",
+  "start_date": "2026-11-01T05:00:00Z",
+  "end_date": "2026-11-03T05:00:00Z",
+  "currencies": [
+    {"currency": "COP", "available_balance": "425000.0000", "income": "41225.0000", "expenses": "121.0000"}
+  ]
 }
 ```
 

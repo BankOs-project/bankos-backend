@@ -12,10 +12,23 @@ class OperationType(str, Enum):
     TRANSFER = "TRANSFER"
 
 
+class TransferMode(str, Enum):
+    SAME_BANK = "SAME_BANK"
+    OTHER_BANK = "OTHER_BANK"
+
+
 class TransactionStatus(str, Enum):
     """Estado de la transacción persistida."""
     SUCCESS = "SUCCESS"
     ERROR = "ERROR"
+
+
+@dataclass(frozen=True)
+class FinancialTotals:
+    currency: str
+    available_balance: Decimal
+    income: Decimal
+    expenses: Decimal
 
 
 @dataclass
@@ -39,6 +52,8 @@ class Transaction:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     actor_user_id: uuid.UUID | None = None
     failure_code: str | None = None
+    transfer_mode: TransferMode | None = None
+    transfer_reference: uuid.UUID | None = None
 
     @classmethod
     def create(
@@ -58,6 +73,8 @@ class Transaction:
         status: TransactionStatus = TransactionStatus.SUCCESS,
         actor_user_id: uuid.UUID | None = None,
         failure_code: str | None = None,
+        transfer_mode: TransferMode | None = None,
+        transfer_reference: uuid.UUID | None = None,
     ) -> "Transaction":
         return cls(
             id=uuid.uuid4(),
@@ -77,6 +94,8 @@ class Transaction:
             created_at=datetime.now(timezone.utc),
             actor_user_id=actor_user_id,
             failure_code=failure_code,
+            transfer_mode=transfer_mode,
+            transfer_reference=transfer_reference,
         )
 
 

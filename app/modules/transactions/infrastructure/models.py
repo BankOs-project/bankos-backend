@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 import uuid
 from sqlalchemy import DateTime, Index, Numeric, String, Text
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -25,6 +25,8 @@ class TransactionModel(Base):
     )
     actor_user_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))
     failure_code: Mapped[str | None] = mapped_column(String(100))
+    transfer_mode: Mapped[str | None] = mapped_column(String(20))
+    transfer_reference: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))
     operation_type: Mapped[str] = mapped_column(
         String(20),
         nullable=False,
@@ -108,4 +110,25 @@ class IdempotencyReceiptModel(Base):
     status_code: Mapped[int]
     body: Mapped[str] = mapped_column(Text)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class TransferQuoteModel(Base):
+    """Autorización temporal de confirmación, privada del remitente."""
+
+    __tablename__ = "transfer_quotes"
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True))
+    user_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True))
+    source_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True))
+    source_number: Mapped[str] = mapped_column(String(20))
+    destination_tenant_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True))
+    destination_public_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))
+    destination_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True))
+    destination_owner_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True))
+    destination_number: Mapped[str] = mapped_column(String(20))
+    snapshot: Mapped[dict] = mapped_column(JSONB)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

@@ -2,9 +2,9 @@ from decimal import Decimal
 from datetime import datetime
 from typing import Annotated, Any
 import uuid
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.modules.transactions.domain.entities import OperationType, TransactionStatus
+from app.modules.transactions.domain.entities import OperationType, TransactionStatus, TransferMode
 
 
 PositiveAmount = Annotated[Decimal, Field(gt=0, max_digits=18, decimal_places=4)]
@@ -16,19 +16,29 @@ class QuoteRequestDTO(BaseModel):
 
     operation_type: OperationType
     source_account_number: str = Field(description="Número de cuenta origen")
-    destination_account_number: str | None = Field(
+    destination_account_number: AccountNumber | None = Field(
         default=None,
         description="Número de cuenta destino (requerido solo en transferencia)",
     )
     amount: PositiveAmount = Field(description="Monto a operar (estrictamente positivo)")
+    transfer_mode: TransferMode | None = None
+    destination_bank_id: uuid.UUID | None = None
 
     @model_validator(mode="after")
     def validate_transfer_destination(self) -> "QuoteRequestDTO":
         if self.operation_type == OperationType.TRANSFER:
             if not self.destination_account_number:
                 raise ValueError("La cotización de transferencia requiere una cuenta destino")
+            if self.transfer_mode == TransferMode.OTHER_BANK:
+                if self.destination_bank_id is None:
+                    raise ValueError("Otro banco requiere destination_bank_id")
+                return self
             if self.source_account_number == self.destination_account_number:
                 raise ValueError("La cuenta origen y destino no pueden ser la misma")
+        elif self.transfer_mode is not None:
+            raise ValueError("transfer_mode solo aplica a transferencias")
+        if self.destination_bank_id is not None:
+            raise ValueError("destination_bank_id solo aplica a transferencias hacia otro banco")
         return self
 
 
@@ -43,6 +53,19 @@ class QuoteResponseDTO(BaseModel):
     amount_to_debit: Decimal
     exchange_rate_applied: Decimal
     final_amount_to_receive: Decimal
+
+
+class RecipientPreviewDTO(BaseModel):
+    bank_name: str
+    masked_holder_name: str
+    account_last_four: str
+
+
+class TransferQuoteDTO(QuoteResponseDTO):
+    quote_id: uuid.UUID
+    expires_at: datetime
+    transfer_mode: TransferMode
+    recipient: RecipientPreviewDTO | None = None
 
 
 class MutableTransactionDTO(BaseModel):
@@ -68,6 +91,7 @@ class WithdrawDTO(MutableTransactionDTO):
 
 class TransferDTO(MutableTransactionDTO):
     """Esquema de solicitud para transferencia interna entre dos cuentas del mismo tenant."""
+    model_config = ConfigDict(extra="forbid")
 
     source_account_number: AccountNumber = Field(description="Cuenta origen del débito")
     destination_account_number: AccountNumber = Field(description="Cuenta destino del crédito")
@@ -80,6 +104,12 @@ class TransferDTO(MutableTransactionDTO):
         if source and v == source:
             raise ValueError("La cuenta origen y destino no pueden ser la misma")
         return v
+
+
+class ConfirmTransferDTO(MutableTransactionDTO):
+    model_config = ConfigDict(extra="forbid")
+
+    quote_id: uuid.UUID
 
 
 class TransactionResponseDTO(BaseModel):
@@ -101,6 +131,8 @@ class TransactionResponseDTO(BaseModel):
     correlation_id: str
     created_at: datetime
     failure_code: str | None = None
+    transfer_mode: TransferMode | None = None
+    transfer_reference: uuid.UUID | None = None
 
 
 class PaginatedTransactionsResponseDTO(BaseModel):
@@ -110,4 +142,18 @@ class PaginatedTransactionsResponseDTO(BaseModel):
     skip: int
     limit: int
     items: list[TransactionResponseDTO]
+
+
+class CurrencySummaryDTO(BaseModel):
+    currency: str
+    available_balance: Decimal
+    income: Decimal
+    expenses: Decimal
+
+
+class FinancialSummaryDTO(BaseModel):
+    account_number: str | None
+    start_date: datetime
+    end_date: datetime
+    currencies: list[CurrencySummaryDTO]
 

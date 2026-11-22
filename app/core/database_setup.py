@@ -20,7 +20,9 @@ async def prepare_schema(connection: AsyncConnection) -> None:
     await connection.execute(text("""
         ALTER TABLE public.transactions
         ADD COLUMN IF NOT EXISTS actor_user_id uuid,
-        ADD COLUMN IF NOT EXISTS failure_code varchar(100)
+        ADD COLUMN IF NOT EXISTS failure_code varchar(100),
+        ADD COLUMN IF NOT EXISTS transfer_mode varchar(20),
+        ADD COLUMN IF NOT EXISTS transfer_reference uuid
     """))
     await connection.execute(text("""
         ALTER TABLE public.users
@@ -41,6 +43,31 @@ async def prepare_schema(connection: AsyncConnection) -> None:
     await connection.execute(text("ALTER TABLE public.users ALTER COLUMN person_id SET NOT NULL"))
     await connection.execute(text("""
         CREATE UNIQUE INDEX IF NOT EXISTS ux_users_tenant_person ON public.users (tenant_id, person_id)
+    """))
+    await connection.execute(text("""
+        ALTER TABLE public.accounts
+        ADD COLUMN IF NOT EXISTS reactivated_at timestamptz,
+        ADD COLUMN IF NOT EXISTS can_deactivate_at timestamptz,
+        ADD COLUMN IF NOT EXISTS requires_admin_reactivation boolean
+    """))
+    await connection.execute(text("""
+        UPDATE public.accounts AS account SET requires_admin_reactivation =
+            CASE WHEN account.status = 'INACTIVE' THEN COALESCE((
+                SELECT COALESCE(audit.new_state->>'actor_role', actor.role) = 'administrador'
+                FROM public.audit_logs AS audit
+                LEFT JOIN public.users AS actor ON actor.id = audit.user_id AND actor.tenant_id = audit.tenant_id
+                WHERE audit.tenant_id = account.tenant_id
+                  AND audit.action = 'ACCOUNT_DEACTIVATED'
+                  AND audit.new_state->>'account_number' = account.account_number
+                ORDER BY audit.created_at DESC, audit.id DESC
+                LIMIT 1
+            ), false) ELSE false END
+        WHERE account.requires_admin_reactivation IS NULL
+    """))
+    await connection.execute(text("""
+        ALTER TABLE public.accounts
+        ALTER COLUMN requires_admin_reactivation SET DEFAULT false,
+        ALTER COLUMN requires_admin_reactivation SET NOT NULL
     """))
 
 

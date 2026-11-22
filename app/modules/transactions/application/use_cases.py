@@ -12,9 +12,12 @@ from app.core.middlewares.correlation_id import get_correlation_id
 from app.modules.accounts.domain.entities import Account, AccountStatus
 from app.modules.accounts.domain.repositories import AccountRepository
 from app.modules.auth_users.domain.entities import UserRole
+from app.modules.tenants.domain.entities import Tenant
 from app.modules.tenants.domain.repositories import TenantRepository
 from app.modules.transactions.application.dtos import (
+    CurrencySummaryDTO,
     DepositDTO,
+    FinancialSummaryDTO,
     PaginatedTransactionsResponseDTO,
     QuoteRequestDTO,
     QuoteResponseDTO,
@@ -33,6 +36,7 @@ from app.modules.transactions.domain.entities import (
     Transaction,
     TransactionQuote,
     TransactionStatus,
+    TransferMode,
 )
 from app.modules.transactions.domain.repositories import (
     TransactionRepository,
@@ -61,6 +65,33 @@ def transaction_to_dto(tx: Transaction) -> TransactionResponseDTO:
         correlation_id=tx.correlation_id,
         created_at=tx.created_at,
         failure_code=tx.failure_code,
+        transfer_mode=tx.transfer_mode,
+        transfer_reference=tx.transfer_reference,
+    )
+
+
+def transfer_terms(
+    tenant: Tenant, source: Account, destination: Account, amount: Decimal, mode: TransferMode,
+) -> QuoteResponseDTO:
+    if amount > tenant.max_transaction_limit:
+        raise BankOSException(
+            f"El monto de la transferencia supera el límite de {tenant.max_transaction_limit} {source.currency}",
+            "TRANSACTION_LIMIT_EXCEEDED", 422,
+        )
+    fee = calculate_fee(amount, tenant) if mode == TransferMode.OTHER_BANK else Decimal("0.0000")
+    rate = get_exchange_rate(source.currency, destination.currency, tenant)
+    received = apply_conversion(amount, rate)
+    if received >= Decimal("100000000000000"):
+        raise BankOSException("El monto convertido excede el máximo permitido", "INVALID_AMOUNT", 422)
+    return QuoteResponseDTO(
+        operation_type=OperationType.TRANSFER,
+        source_currency=source.currency,
+        destination_currency=destination.currency,
+        original_amount=amount,
+        fee_calculated=fee,
+        amount_to_debit=amount + fee,
+        exchange_rate_applied=rate,
+        final_amount_to_receive=received,
     )
 
 
@@ -161,35 +192,17 @@ class QuoteTransactionUseCase:
 
         amount = Decimal(str(dto.amount))
         source_currency = source.currency
-        dest_currency = source_currency
-        exchange_rate = ONE
-
-        if dto.operation_type == OperationType.TRANSFER and dto.destination_account_number:
-            dest_acc = await self.account_repository.get_by_account_number(
-                account_number=dto.destination_account_number,
-                tenant_id=tenant_id,
-            )
-            if not dest_acc:
-                raise ResourceNotFoundException(
-                    f"Cuenta destino '{dto.destination_account_number}' no encontrada"
-                )
-            dest_acc.ensure_can_operate()
-            dest_currency = dest_acc.currency
-            exchange_rate = get_exchange_rate(source_currency, dest_currency, tenant)
-
-        fee = calculate_fee(amount, tenant) if dto.operation_type == OperationType.TRANSFER else Decimal("0.0000")
-        amount_to_debit = Decimal("0.0000") if dto.operation_type == OperationType.DEPOSIT else amount + fee
-        final_amount = apply_conversion(amount, exchange_rate)
+        amount_to_debit = Decimal("0.0000") if dto.operation_type == OperationType.DEPOSIT else amount
 
         return QuoteResponseDTO(
             operation_type=dto.operation_type,
             source_currency=source_currency,
-            destination_currency=dest_currency,
+            destination_currency=source_currency,
             original_amount=amount,
-            fee_calculated=fee,
+            fee_calculated=Decimal("0.0000"),
             amount_to_debit=amount_to_debit,
-            exchange_rate_applied=exchange_rate,
-            final_amount_to_receive=final_amount,
+            exchange_rate_applied=ONE,
+            final_amount_to_receive=apply_conversion(amount, ONE),
         )
 
 
@@ -396,20 +409,9 @@ class InternalTransferUseCase:
 
         amount = Decimal(str(dto.amount))
 
-        # 5. Validar límite máximo de transacción del tenant
-        if amount > tenant.max_transaction_limit:
-            raise BankOSException(
-                message=(
-                    f"El monto de la transferencia ({amount} {source.currency}) supera el límite "
-                    f"máximo permitido por la institución ({tenant.max_transaction_limit} {source.currency})"
-                ),
-                internal_code="TRANSACTION_LIMIT_EXCEEDED",
-                status_code=422,
-            )
-
-        # 6. Calcular comisión con Decimal puro
-        fee = calculate_fee(amount, tenant)
-        total_to_debit = amount + fee
+        terms = transfer_terms(tenant, source, destination, amount, TransferMode.SAME_BANK)
+        fee = terms.fee_calculated
+        total_to_debit = terms.amount_to_debit
 
         # 7. Verificar saldo suficiente para monto + comisión (antes del lock dominio)
         if source.balance < total_to_debit:
@@ -423,8 +425,8 @@ class InternalTransferUseCase:
             )
 
         # 8. Calcular conversión de divisa si las cuentas tienen monedas distintas
-        exchange_rate = get_exchange_rate(source.currency, destination.currency, tenant)
-        converted_amount = apply_conversion(amount, exchange_rate)
+        exchange_rate = terms.exchange_rate_applied
+        converted_amount = terms.final_amount_to_receive
 
         # 9. Aplicar movimientos en las entidades de dominio (incluye validación interna)
         source.debit(total_to_debit)
@@ -486,23 +488,11 @@ class GetTransactionHistoryUseCase:
             start_date = start_date.replace(tzinfo=timezone.utc)
         if end_date is not None and end_date.tzinfo is None:
             end_date = end_date.replace(tzinfo=timezone.utc)
-        if start_date is not None and end_date is not None and start_date > end_date:
-            raise BankOSException(
-                message="start_date debe ser anterior o igual a end_date",
-                internal_code="INVALID_DATE_RANGE",
-                status_code=422,
-            )
+        _validate_period(start_date, end_date)
 
         if actor_role == UserRole.CLIENT:
             if account_number:
-                account = await self.account_repository.get_by_account_number(
-                    account_number=account_number,
-                    tenant_id=tenant_id,
-                )
-                if not account or account.owner_id != actor_user_id:
-                    raise AuthorizationFailedException(
-                        "No posee autorización para consultar el historial de esta cuenta"
-                    )
+                await _require_owned_account(self.account_repository, tenant_id, actor_user_id, account_number)
 
             txs, total = await self.transaction_repository.list_by_owner_accounts(
                 tenant_id=tenant_id,
@@ -531,4 +521,58 @@ class GetTransactionHistoryUseCase:
             skip=skip,
             limit=limit,
             items=[transaction_to_dto(tx) for tx in txs],
+        )
+
+
+def _validate_period(start_date: datetime | None, end_date: datetime | None) -> None:
+    if start_date is not None and end_date is not None and start_date > end_date:
+        raise BankOSException(
+            message="start_date debe ser anterior o igual a end_date",
+            internal_code="INVALID_DATE_RANGE",
+            status_code=422,
+        )
+
+
+async def _require_owned_account(
+    repository: AccountRepository, tenant_id: uuid.UUID, user_id: uuid.UUID, account_number: str,
+) -> None:
+    account = await repository.get_by_account_number(account_number=account_number, tenant_id=tenant_id)
+    if not account or account.owner_id != user_id:
+        raise AuthorizationFailedException("No posee autorización para consultar esta cuenta")
+
+
+class GetFinancialSummaryUseCase:
+    """Consulta el saldo actual y los flujos del período para el titular autenticado."""
+
+    def __init__(
+        self, transaction_repository: TransactionRepository, account_repository: AccountRepository,
+    ) -> None:
+        self.transaction_repository = transaction_repository
+        self.account_repository = account_repository
+
+    async def execute(
+        self,
+        tenant_id: uuid.UUID,
+        actor_user_id: uuid.UUID,
+        start_date: datetime,
+        end_date: datetime,
+        account_number: str | None = None,
+    ) -> FinancialSummaryDTO:
+        start_date = start_date.astimezone(timezone.utc)
+        end_date = end_date.astimezone(timezone.utc)
+        _validate_period(start_date, end_date)
+        if account_number:
+            await _require_owned_account(self.account_repository, tenant_id, actor_user_id, account_number)
+        totals = await self.transaction_repository.summarize_owner_accounts(
+            tenant_id=tenant_id,
+            owner_id=actor_user_id,
+            start_date=start_date,
+            end_date=end_date,
+            account_number=account_number,
+        )
+        return FinancialSummaryDTO(
+            account_number=account_number,
+            start_date=start_date,
+            end_date=end_date,
+            currencies=[CurrencySummaryDTO.model_validate(total, from_attributes=True) for total in totals],
         )

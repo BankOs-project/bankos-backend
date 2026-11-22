@@ -41,6 +41,8 @@ class Settings(BaseSettings):
     DATABASE_URL: str | None = None
     DATABASE_MANAGED_SCHEMA: bool = False
     RATE_LIMIT_TRUSTED_PROXIES: str = ""
+    ACCOUNT_DEACTIVATION_COOLDOWN_HOURS: int = Field(default=24, ge=1)
+    SIMULATED_INTERBANK_ENABLED: bool = False
 
     # Motor en Memoria (Redis 7)
     REDIS_HOST: str = "localhost"

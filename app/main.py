@@ -68,10 +68,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             except Exception as exc:
                 logger.warning("Verificación de rol audit_logs append-only no cumplida: %s", exc)
             await conn.execute(text("SELECT public_id, directory_enabled, logo_url FROM public.tenants LIMIT 0"))
-            await conn.execute(text("SELECT actor_user_id, failure_code FROM public.transactions LIMIT 0"))
+            await conn.execute(text("""
+                SELECT actor_user_id, failure_code, transfer_mode, transfer_reference FROM public.transactions LIMIT 0
+            """))
+            await conn.execute(text("SELECT id FROM public.transfer_quotes LIMIT 0"))
             await conn.execute(text("SELECT key FROM public.transaction_idempotency_receipts LIMIT 0"))
             await conn.execute(text("SELECT person_id, email_verified_at FROM public.users LIMIT 0"))
             await conn.execute(text("SELECT id FROM public.registration_challenges LIMIT 0"))
+            await conn.execute(text("""
+                SELECT reactivated_at, can_deactivate_at, requires_admin_reactivation
+                FROM public.accounts LIMIT 0
+            """))
         else:
             await prepare_schema(conn)
             try:

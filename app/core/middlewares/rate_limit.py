@@ -40,20 +40,21 @@ LOGIN_IP = RateLimitRule(10)
 LOGIN_ACCOUNT = RateLimitRule(5)
 TRANSACTION_IP = RateLimitRule(30)
 TRANSACTION_USER = RateLimitRule(60)
+INTERBANK_QUOTE_USER = RateLimitRule(8)
 REGISTRATION_IP = RateLimitRule(15)
 REGISTRATION_MAIL = RateLimitRule(3, 900)
 
 
-async def _enforce(key: str, rule: RateLimitRule, *, require_redis: bool = False) -> None:
+async def _enforce(key: str, rule: RateLimitRule, *, unavailable_code: str | None = None) -> None:
     try:
         async with asyncio.timeout(1):
             async with Redis(connection_pool=get_redis_pool()) as redis:
                 count, ttl = await redis.eval(INCREMENT_WINDOW, 1, key, rule.window_seconds)
     except (RedisError, TimeoutError):
         logger.warning("Redis no disponible para rate limiting", exc_info=True)
-        if require_redis:
+        if unavailable_code is not None:
             raise BankOSException(
-                "El registro no está disponible temporalmente", "REGISTRATION_UNAVAILABLE", 503,
+                "El servicio no está disponible temporalmente", unavailable_code, 503,
             ) from None
         return
 
@@ -73,13 +74,21 @@ async def enforce_transaction_user_limit(
     await _enforce(f"rl:transactions:user:{user.tenant_id}:{user.user_id}", TRANSACTION_USER)
 
 
+async def enforce_interbank_quote_limit(tenant_id: UUID, user_id: UUID) -> None:
+    await _enforce(
+        f"rl:interbank:quote:{tenant_id}:{user_id}",
+        INTERBANK_QUOTE_USER,
+        unavailable_code="TRANSFER_QUOTE_UNAVAILABLE",
+    )
+
+
 async def enforce_registration_mail_limit(
     tenant_id: UUID, email: str, source_user_id: UUID | None = None,
 ) -> None:
     digest = sha256(email.encode()).hexdigest()
-    await _enforce(f"rl:register:mail:{tenant_id}:{digest}", REGISTRATION_MAIL, require_redis=True)
+    await _enforce(f"rl:register:mail:{tenant_id}:{digest}", REGISTRATION_MAIL, unavailable_code="REGISTRATION_UNAVAILABLE")
     if source_user_id is not None:
-        await _enforce(f"rl:register:source:{source_user_id}", REGISTRATION_MAIL, require_redis=True)
+        await _enforce(f"rl:register:source:{source_user_id}", REGISTRATION_MAIL, unavailable_code="REGISTRATION_UNAVAILABLE")
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):

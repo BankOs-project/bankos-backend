@@ -28,7 +28,7 @@ OPERATIONS = {
     "withdraw": ({"account_number": SOURCE, "amount": "10"}, Decimal("-10"), Decimal("0")),
     "transfer": (
         {"source_account_number": SOURCE, "destination_account_number": DESTINATION, "amount": "10"},
-        Decimal("-10.15"),
+        Decimal("-10"),
         Decimal("42000"),
     ),
 }

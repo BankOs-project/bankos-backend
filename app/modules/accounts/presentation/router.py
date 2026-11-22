@@ -4,12 +4,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.exceptions import AuthorizationFailedException, ResourceNotFoundException
-from app.core.responses import success_response
-from app.modules.accounts.application.dtos import CreateAccountDTO
+from app.core.responses import APIResponse, success_response
+from app.modules.accounts.application.dtos import AccountResponseDTO, CreateAccountDTO
 from app.modules.accounts.domain.entities import AccountStatus
 from app.modules.accounts.application.use_cases import (
+    ChangeAccountStatusUseCase,
     CreateAccountUseCase,
-    DeactivateAccountUseCase,
     ListAccountsUseCase,
 )
 from app.modules.accounts.infrastructure.repositories import PostgresAccountRepository
@@ -129,6 +129,7 @@ async def get_transfer_destination(
 @router.get(
     "/{account_number}",
     summary="Consultar detalle de una cuenta bancaria",
+    response_model=APIResponse[AccountResponseDTO],
 )
 async def get_account_detail(
     account_number: str,
@@ -150,20 +151,8 @@ async def get_account_detail(
     if current_user.role == UserRole.CLIENT and account.owner_id != current_user.user_id:
         raise AuthorizationFailedException("No posee permisos para consultar esta cuenta")
 
-    data = {
-        "id": str(account.id),
-        "account_number": account.account_number,
-        "owner_id": str(account.owner_id),
-        "tenant_id": str(account.tenant_id),
-        "balance": str(account.balance),
-        "currency": account.currency,
-        "status": account.status.value,
-        "created_at": account.created_at.isoformat(),
-        "updated_at": account.updated_at.isoformat(),
-    }
-
     return success_response(
-        data=data,
+        data=AccountResponseDTO.model_validate(account, from_attributes=True).model_dump(mode="json"),
         message="Detalle de la cuenta obtenido exitosamente",
         internal_code="ACCOUNT_DETAIL_FETCHED",
     )
@@ -172,28 +161,52 @@ async def get_account_detail(
 @router.patch(
     "/{account_number}/deactivate",
     summary="Desactivar cuenta bancaria (Soft Delete con auditoría)",
+    response_model=APIResponse[AccountResponseDTO],
 )
 async def deactivate_account(
     account_number: str,
     current_user: AuthenticatedUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ):
-    """Aplica borrado lógico (estado INACTIVE) a la cuenta bancaria y audita el cambio."""
-    account_repo = PostgresAccountRepository(session)
-    audit_repo = PostgresAuditRepository(session)
-    use_case = DeactivateAccountUseCase(account_repo, audit_repo)
+    return await _change_account_status(account_number, current_user, session, reactivate=False)
+
+
+@router.patch(
+    "/{account_number}/reactivate",
+    summary="Reactivar cuenta inactiva",
+    response_model=APIResponse[AccountResponseDTO],
+)
+async def reactivate_account(
+    account_number: str,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+):
+    return await _change_account_status(account_number, current_user, session, reactivate=True)
+
+
+async def _change_account_status(
+    account_number: str,
+    current_user: AuthenticatedUser,
+    session: AsyncSession,
+    *,
+    reactivate: bool,
+):
+    use_case = ChangeAccountStatusUseCase(
+        PostgresAccountRepository(session), PostgresAuditRepository(session),
+    )
 
     result = await use_case.execute(
         account_number=account_number,
         tenant_id=current_user.tenant_id,
         actor_user_id=current_user.user_id,
         actor_role=current_user.role,
+        reactivate=reactivate,
     )
     await session.commit()
 
     return success_response(
         data=result.model_dump(mode="json"),
-        message="Cuenta bancaria desactivada exitosamente (Soft Delete registrado en auditoría)",
-        internal_code="ACCOUNT_DEACTIVATED",
+        message="Cuenta bancaria reactivada" if reactivate else "Cuenta bancaria desactivada",
+        internal_code="ACCOUNT_REACTIVATED" if reactivate else "ACCOUNT_DEACTIVATED",
     )
 

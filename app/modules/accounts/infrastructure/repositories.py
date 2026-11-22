@@ -25,6 +25,9 @@ class PostgresAccountRepository(AccountRepository):
             status=AccountStatus(model.status),
             created_at=model.created_at,
             updated_at=model.updated_at,
+            reactivated_at=model.reactivated_at,
+            can_deactivate_at=model.can_deactivate_at,
+            requires_admin_reactivation=model.requires_admin_reactivation,
         )
 
     async def create(self, account: Account) -> Account:
@@ -38,6 +41,9 @@ class PostgresAccountRepository(AccountRepository):
             status=account.status.value,
             created_at=account.created_at,
             updated_at=account.updated_at,
+            reactivated_at=account.reactivated_at,
+            can_deactivate_at=account.can_deactivate_at,
+            requires_admin_reactivation=account.requires_admin_reactivation,
         )
         self.session.add(model)
         await self.session.flush()
@@ -138,6 +144,9 @@ class PostgresAccountRepository(AccountRepository):
         model.status = account.status.value
         model.currency = account.currency
         model.updated_at = account.updated_at
+        model.reactivated_at = account.reactivated_at
+        model.can_deactivate_at = account.can_deactivate_at
+        model.requires_admin_reactivation = account.requires_admin_reactivation
 
         await self.session.flush()
         return self._to_entity(model)
